@@ -1,4 +1,5 @@
 import calendar
+import itertools
 import json
 import os
 import shutil
@@ -17,7 +18,6 @@ from attr import attrs, attrib
 from pathlib2 import Path
 
 from .. import Task, StorageManager, Logger
-from ..backend_api.session.client import APIClient
 from ..backend_api import Session
 from ..backend_interface.task.development.worker import DevWorker
 from ..backend_interface.util import mutually_exclusive, exact_match_regex, get_or_create_project, rename_project
@@ -122,12 +122,14 @@ class Dataset(object):
     __hyperparams_section = "Datasets"
     __datasets_runtime_prop = "datasets"
     __orig_datasets_runtime_prop_prefix = "orig_datasets"
+    __preview_media_max_file_size = deferred_config("dataset.preview.media.max_file_size", 5 * 1024 * 1024, transform=int)
     __preview_tabular_table_count = deferred_config("dataset.preview.tabular.table_count", 10, transform=int)
     __preview_tabular_row_count = deferred_config("dataset.preview.tabular.row_count", 10, transform=int)
     __preview_media_image_count = deferred_config("dataset.preview.media.image_count", 10, transform=int)
     __preview_media_video_count = deferred_config("dataset.preview.media.video_count", 10, transform=int)
     __preview_media_audio_count = deferred_config("dataset.preview.media.audio_count", 10, transform=int)
     __preview_media_html_count = deferred_config("dataset.preview.media.html_count", 10, transform=int)
+    __preview_media_json_count = deferred_config("dataset.preview.media.json_count", 10, transform=int)
     _dataset_chunk_size_mb = deferred_config("storage.dataset_chunk_size_mb", 512, transform=int)
 
     def __init__(
@@ -157,6 +159,8 @@ class Dataset(object):
                 LoggerRoot.get_base_logger().warning(
                     "Setting non-semantic dataset version '{}'".format(self._dataset_version)
                 )
+        if dataset_name == "":
+            raise ValueError("`dataset_name` cannot be an empty string")
         if task:
             self._task_pinger = None
             self._created_task = False
@@ -191,7 +195,7 @@ class Dataset(object):
             if "/.datasets/" not in task.get_project_name() or "":
                 dataset_project, parent_project = self._build_hidden_project_name(task.get_project_name(), task.name)
                 task.move_to_project(new_project_name=dataset_project)
-                if bool(Session.check_min_api_server_version(Dataset.__min_api_version)):
+                if Dataset.is_offline() or bool(Session.check_min_api_server_version(Dataset.__min_api_version)):
                     get_or_create_project(task.session, project_name=parent_project, system_tags=[self.__hidden_tag])
                     get_or_create_project(
                         task.session,
@@ -202,9 +206,21 @@ class Dataset(object):
         else:
             self._created_task = True
             dataset_project, parent_project = self._build_hidden_project_name(dataset_project, dataset_name)
-            task = Task.create(
-                project_name=dataset_project, task_name=dataset_name, task_type=Task.TaskTypes.data_processing)
-            if bool(Session.check_min_api_server_version(Dataset.__min_api_version)):
+            if not Dataset.is_offline():
+                task = Task.create(
+                    project_name=dataset_project, task_name=dataset_name, task_type=Task.TaskTypes.data_processing)
+            else:
+                task = Task.init(
+                    project_name=dataset_project,
+                    task_name=dataset_name,
+                    task_type=Task.TaskTypes.data_processing,
+                    reuse_last_task_id=False,
+                    auto_connect_frameworks=False,
+                    auto_connect_arg_parser=False,
+                    auto_resource_monitoring=False,
+                    auto_connect_streams=False
+                )
+            if Dataset.is_offline() or bool(Session.check_min_api_server_version(Dataset.__min_api_version)):
                 get_or_create_project(task.session, project_name=parent_project, system_tags=[self.__hidden_tag])
                 get_or_create_project(
                     task.session,
@@ -218,25 +234,25 @@ class Dataset(object):
             if dataset_tags:
                 task.set_tags((task.get_tags() or []) + list(dataset_tags))
             task.mark_started()
-            # generate the script section
-            script = (
-                "from clearml import Dataset\n\n"
-                "ds = Dataset.create(dataset_project='{dataset_project}', dataset_name='{dataset_name}', "
-                "dataset_version='{dataset_version}')\n".format(
-                    dataset_project=dataset_project, dataset_name=dataset_name, dataset_version=dataset_version
+            if not Dataset.is_offline():
+                # generate the script section
+                script = (
+                    "from clearml import Dataset\n\n"
+                    "ds = Dataset.create(dataset_project='{dataset_project}', dataset_name='{dataset_name}', "
+                    "dataset_version='{dataset_version}')\n".format(
+                        dataset_project=dataset_project, dataset_name=dataset_name, dataset_version=dataset_version
+                    )
                 )
-            )
-            task.data.script.diff = script
-            task.data.script.working_dir = '.'
-            task.data.script.entry_point = 'register_dataset.py'
-            from clearml import __version__
-            task.data.script.requirements = {'pip': 'clearml == {}\n'.format(__version__)}
-            # noinspection PyProtectedMember
-            task._edit(script=task.data.script)
-
-            # if the task is running make sure we ping to the server so it will not be aborted by a watchdog
-            self._task_pinger = DevWorker()
-            self._task_pinger.register(task, stop_signal_support=False)
+                task.data.script.diff = script
+                task.data.script.working_dir = '.'
+                task.data.script.entry_point = 'register_dataset.py'
+                from clearml import __version__
+                task.data.script.requirements = {'pip': 'clearml == {}\n'.format(__version__)}
+                # noinspection PyProtectedMember
+                task._edit(script=task.data.script)
+                # if the task is running make sure we ping to the server so it will not be aborted by a watchdog
+                self._task_pinger = DevWorker()
+                self._task_pinger.register(task, stop_signal_support=False)
             # set the newly created Dataset parent ot the current Task, so we know who created it.
             if Task.current_task() and Task.current_task().id != task.id:
                 task.set_parent(Task.current_task())
@@ -279,6 +295,7 @@ class Dataset(object):
         self.__preview_video_count = 0
         self.__preview_audio_count = 0
         self.__preview_html_count = 0
+        self.__preview_json_count = 0
 
     @property
     def id(self):
@@ -309,6 +326,7 @@ class Dataset(object):
         # type: () -> Mapping[str, LinkEntry]
         """
         Notice this call returns an internal representation, do not modify!
+
         :return: dict with relative file path as key, and LinkEntry as value
         """
         return self._dataset_link_entries
@@ -321,7 +339,7 @@ class Dataset(object):
     @property
     def name(self):
         # type: () -> str
-        if bool(Session.check_min_api_server_version(Dataset.__min_api_version)):
+        if Dataset.is_offline() or bool(Session.check_min_api_server_version(Dataset.__min_api_version)):
             return self._task.get_project_name().partition("/.datasets/")[-1]
         return self._task.name
 
@@ -417,7 +435,7 @@ class Dataset(object):
         self,
         source_url,  # type: Union[str, Sequence[str]]
         wildcard=None,  # type: Optional[Union[str, Sequence[str]]]
-        dataset_path=None,  # type: Optional[str]
+        dataset_path=None,  # type: Optional[Union[str,Sequence[str]]]
         recursive=True,  # type: bool
         verbose=False,  # type: bool
         max_workers=None  # type: Optional[int]
@@ -444,9 +462,13 @@ class Dataset(object):
             the dataset (e.g. [s3://bucket/folder/file.csv, http://web.com/file.txt])
         :param wildcard: add only specific set of files.
             Wildcard matching, can be a single string or a list of wildcards.
-        :param dataset_path: The location in the dataset where the file will be downloaded into.
+        :param dataset_path: The location in the dataset where the file will be downloaded into, or list/touple of
+            locations (if list/touple, it must be the same length as ``source_url``).
             e.g: for source_url='s3://bucket/remote_folder/image.jpg' and dataset_path='s3_files',
-            'image.jpg' will be downloaded to 's3_files/image.jpg' (relative path to the dataset)
+            'image.jpg' will be downloaded to 's3_files/image.jpg' (relative path to the dataset).
+            For source_url=['s3://bucket/remote_folder/image.jpg', 's3://bucket/remote_folder/image2.jpg'] and
+            dataset_path=['s3_files', 's3_files_2'], 'image.jpg' will be downloaded to 's3_files/image.jpg' and
+            'image2.jpg' will be downloaded to 's3_files_2/image2.jpg' (relative path to the dataset).
         :param recursive: If True, match all wildcard files recursively
         :param verbose: If True, print to console files added/modified
         :param max_workers: The number of threads to add the external files with. Useful when `source_url` is
@@ -459,14 +481,23 @@ class Dataset(object):
         source_url_list = source_url if not isinstance(source_url, str) else [source_url]
         max_workers = max_workers or psutil.cpu_count()
         futures_ = []
+        if isinstance(dataset_path, str) or dataset_path is None:
+            dataset_paths = itertools.repeat(dataset_path)
+        else:
+            if len(dataset_path) != len(source_url):
+                raise ValueError(
+                    "dataset_path must be a string or a list of strings with the same length as source_url"
+                    " (received {} paths for {} source urls))".format(len(dataset_path), len(source_url))
+                )
+            dataset_paths = dataset_path
         with ThreadPoolExecutor(max_workers=max_workers) as tp:
-            for source_url_ in source_url_list:
+            for source_url_, dataset_path_ in zip(source_url_list, dataset_paths):
                 futures_.append(
                     tp.submit(
                         self._add_external_files,
                         source_url_,
                         wildcard=wildcard,
-                        dataset_path=dataset_path,
+                        dataset_path=dataset_path_,
                         recursive=recursive,
                         verbose=verbose,
                     )
@@ -538,7 +569,7 @@ class Dataset(object):
         return removed
 
     def sync_folder(self, local_path, dataset_path=None, verbose=False):
-        # type: (Union[Path, _Path, str], Union[Path, _Path, str], bool) -> (int, int)
+        # type: (Union[Path, _Path, str], Union[Path, _Path, str], bool) -> (int, int, int)
         """
         Synchronize the dataset with a local folder. The dataset is synchronized from the
         relative_base_folder (default: dataset root)  and deeper with the specified local path.
@@ -619,13 +650,17 @@ class Dataset(object):
             If -1 is provided, use a single zip artifact for the entire dataset change-set (old behaviour)
         :param max_workers: Numbers of threads to be spawned when zipping and uploading the files.
             If None (default) it will be set to:
-            - 1: if the upload destination is a cloud provider ('s3', 'gs', 'azure')
-            - number of logical cores: otherwise
+
+          - 1: if the upload destination is a cloud provider ('s3', 'gs', 'azure')
+          - number of logical cores: otherwise
         :param int retries: Number of retries before failing to upload each zip. If 0, the upload is not retried.
 
         :raise: If the upload failed (i.e. at least one zip failed to upload), raise a `ValueError`
         """
         self._report_dataset_preview()
+        if Dataset.is_offline():
+            self._serialize()
+            return
 
         # set output_url
         if output_url:
@@ -633,7 +668,11 @@ class Dataset(object):
             self._task.get_logger().set_default_upload_destination(output_url)
 
         if not max_workers:
-            max_workers = 1 if self._task.output_uri.startswith(tuple(cloud_driver_schemes)) else psutil.cpu_count()
+            max_workers = (
+                1
+                if self._task.output_uri and self._task.output_uri.startswith(tuple(cloud_driver_schemes))
+                else psutil.cpu_count()
+            )
 
         self._task.get_logger().report_text(
             "Uploading dataset files: {}".format(
@@ -765,6 +804,9 @@ class Dataset(object):
         :param raise_on_error: If True, raise exception if dataset finalizing failed
         :param auto_upload: Automatically upload dataset if not called yet, will upload to default location.
         """
+        if Dataset.is_offline():
+            LoggerRoot.get_base_logger().warning("Cannot finalize dataset in offline mode.")
+            return
         # check we do not have files waiting for upload.
         if self._dirty:
             if auto_upload:
@@ -805,8 +847,10 @@ class Dataset(object):
         # type: (Union[numpy.array, pd.DataFrame, Dict[str, Any]], str, bool) -> () # noqa: F821
         """
         Attach a user-defined metadata to the dataset. Check `Task.upload_artifact` for supported types.
-        If type is Optionally make it visible as a table in the UI.
+        If type is Pandas Dataframes, optionally make it visible as a table in the UI.
         """
+        if metadata_name.startswith(self.__data_entry_name_prefix):
+            raise ValueError("metadata_name can not start with '{}'".format(self.__data_entry_name_prefix))
         self._task.upload_artifact(name=metadata_name, artifact_object=metadata)
         if ui_visible:
             if pd and isinstance(metadata, pd.DataFrame):
@@ -894,6 +938,8 @@ class Dataset(object):
         :return: A base folder for the entire dataset
         """
         assert self._id
+        if Dataset.is_offline():
+            raise ValueError("Cannot get dataset local copy in offline mode.")
         if not self._task:
             self._task = Task.get_task(task_id=self._id)
         if not self.is_final():
@@ -916,7 +962,7 @@ class Dataset(object):
         # type: (Union[Path, _Path, str], bool, Optional[int], Optional[int], bool, Optional[int]) -> Optional[str]
         """
         return a base folder with a writable (mutable) local copy of the entire dataset
-            download and copy / soft-link, files from all the parent dataset versions
+        download and copy / soft-link, files from all the parent dataset versions
 
         :param target_folder: Target folder for the writable copy
         :param overwrite: If True, recursively delete the target folder before creating a copy.
@@ -939,6 +985,8 @@ class Dataset(object):
         :return: The target folder containing the entire dataset
         """
         assert self._id
+        if Dataset.is_offline():
+            raise ValueError("Cannot get dataset local copy in offline mode.")
         max_workers = max_workers or psutil.cpu_count()
         target_folder = Path(target_folder).absolute()
         target_folder.mkdir(parents=True, exist_ok=True)
@@ -968,7 +1016,7 @@ class Dataset(object):
         :param dataset_path: Only match files matching the dataset_path (including wildcards).
             Example: 'folder/sub/*.json'
         :param recursive: If True (default), matching dataset_path recursively
-        :param dataset_id: Filter list based on the dataset id containing the latest version of the file.
+        :param dataset_id: Filter list based on the dataset ID containing the latest version of the file.
             Default: None, do not filter files based on parent dataset.
 
         :return: List of files with relative path
@@ -1013,7 +1061,7 @@ class Dataset(object):
         """
         return a list of files removed when comparing to a specific dataset_id
 
-        :param dataset_id: dataset id (str) to compare against, if None is given compare against the parents datasets
+        :param dataset_id: dataset ID (str) to compare against, if None is given compare against the parents datasets
         :return: List of files with relative path
             (files might not be available locally until get_local_copy() is called)
         """
@@ -1034,7 +1082,7 @@ class Dataset(object):
         """
         return a list of files modified when comparing to a specific dataset_id
 
-        :param dataset_id: dataset id (str) to compare against, if None is given compare against the parents datasets
+        :param dataset_id: dataset ID (str) to compare against, if None is given compare against the parents datasets
         :return: List of files with relative path
             (files might not be available locally until get_local_copy() is called)
         """
@@ -1067,7 +1115,7 @@ class Dataset(object):
         """
         return a list of files added when comparing to a specific dataset_id
 
-        :param dataset_id: dataset id (str) to compare against, if None is given compare against the parents datasets
+        :param dataset_id: dataset ID (str) to compare against, if None is given compare against the parents datasets
         :return: List of files with relative path
             (files might not be available locally until get_local_copy() is called)
         """
@@ -1183,16 +1231,19 @@ class Dataset(object):
         :param output_uri: Location to upload the datasets file to, including preview samples.
             The following are examples of ``output_uri`` values for the supported locations:
 
-            - A shared folder: ``/mnt/share/folder``
-            - S3: ``s3://bucket/folder``
-            - Google Cloud Storage: ``gs://bucket-name/folder``
-            - Azure Storage: ``azure://company.blob.core.windows.net/folder/``
-            - Default file server: None
+          - A shared folder: ``/mnt/share/folder``
+          - S3: ``s3://bucket/folder``
+          - Google Cloud Storage: ``gs://bucket-name/folder``
+          - Azure Storage: ``azure://company.blob.core.windows.net/folder/``
+          - Default file server: None
 
         :param description: Description of the dataset
 
         :return: Newly created Dataset object
         """
+        if not Dataset.is_offline() and not Session.check_min_api_server_version("2.13"):
+            raise NotImplementedError("Datasets are not supported with your current ClearML server version. Please update your server.")
+
         parent_datasets = [cls.get(dataset_id=p) if not isinstance(p, Dataset) else p for p in (parent_datasets or [])]
         if any(not p.is_final() for p in parent_datasets):
             raise ValueError("Cannot inherit from a parent that was not finalized/closed")
@@ -1250,7 +1301,7 @@ class Dataset(object):
         if description:
             instance.set_description(description)
         # noinspection PyProtectedMember
-        if output_uri and not Task._offline_mode:
+        if output_uri and not Dataset.is_offline():
             # noinspection PyProtectedMember
             instance._task.output_uri = output_uri
             # noinspection PyProtectedMember
@@ -1269,20 +1320,13 @@ class Dataset(object):
         instance._serialize()
         # noinspection PyProtectedMember
         instance._report_dataset_struct()
-        # noinspection PyProtectedMember
-        instance._task.get_logger().report_text(
-            "ClearML results page: {}".format(instance._task.get_output_log_web_page())
-        )
-        if bool(Session.check_min_api_server_version(cls.__min_api_version)):
-            instance._task.get_logger().report_text(  # noqa
-                "ClearML dataset page: {}".format(
-                    "{}/datasets/simple/{}/experiments/{}".format(
-                        instance._task._get_app_server(),  # noqa
-                        instance._task.project if instance._task.project is not None else "*",  # noqa
-                        instance._task.id,  # noqa
-                    )
-                )
+        if not Dataset.is_offline():
+            # noinspection PyProtectedMember
+            instance._task.get_logger().report_text(
+                "ClearML results page: {}".format(instance._task.get_output_log_web_page())
             )
+            # noinspection PyProtectedMember
+            instance._log_dataset_page()
         # noinspection PyProtectedMember
         instance._task.flush(wait_for_uploads=True)
         # noinspection PyProtectedMember
@@ -1408,7 +1452,9 @@ class Dataset(object):
         force=False,  # bool
         dataset_version=None,  # Optional[str]
         entire_dataset=False,  # bool
-        shallow_search=False  # bool
+        shallow_search=False,  # bool
+        delete_files=True,  # bool
+        delete_external_files=False  # bool
     ):
         # type: (...) -> ()
         """
@@ -1424,6 +1470,9 @@ class Dataset(object):
         :param entire_dataset: If True, delete all datasets that match the given `dataset_project`,
             `dataset_name`, `dataset_version`. Note that `force` has to be True if this parameter is True
         :param shallow_search: If True, search only the first 500 results (first page)
+        :param delete_files: Delete all local files in the dataset (from the ClearML file server), as well as
+            all artifacts related to the dataset.
+        :param delete_external_files: Delete all external files in the dataset (from their external storage)
         """
         if not any([dataset_id, dataset_project, dataset_name]):
             raise ValueError("Dataset deletion criteria not met. Didn't provide id/name/project correctly.")
@@ -1444,28 +1493,26 @@ class Dataset(object):
                 action="delete",
             )
         except Exception as e:
-            LoggerRoot.get_base_logger().warning("Error: {}".format(str(e)))
+            LoggerRoot.get_base_logger().warning("Failed deleting dataset: {}".format(str(e)))
             return
-        client = APIClient()
         for dataset_id in dataset_ids:
-            task = Task.get_task(task_id=dataset_id)
-            if str(task.task_type) != str(Task.TaskTypes.data_processing) or cls.__tag not in (
-                task.get_system_tags() or []
-            ):
-                LoggerRoot.get_base_logger().warning("Task id={} is not of type Dataset".format(dataset_id))
+            try:
+                dataset = Dataset.get(dataset_id=dataset_id)
+            except Exception as e:
+                LoggerRoot.get_base_logger().warning("Could not get dataset with ID {}: {}".format(dataset_id, str(e)))
                 continue
-            for artifact in task.artifacts.values():
-                h = StorageHelper.get(artifact.url)
-                # noinspection PyBroadException
-                try:
-                    h.delete(artifact.url)
-                except Exception as ex:
-                    LoggerRoot.get_base_logger().warning(
-                        "Failed deleting remote file '{}': {}".format(artifact.url, ex)
-                    )
-            # this force is different than the force passed in Dataset.delete
-            # it indicated that we want delete a non-draft task
-            client.tasks.delete(task=dataset_id, force=True)
+            # noinspection PyProtectedMember
+            dataset._task.delete(delete_artifacts_and_models=delete_files)
+            if delete_external_files:
+                for external_file in dataset.link_entries:
+                    if external_file.parent_dataset_id == dataset_id:
+                        try:
+                            helper = StorageHelper.get(external_file.link)
+                            helper.delete(external_file.link)
+                        except Exception as ex:
+                            LoggerRoot.get_base_logger().warning(
+                                "Failed deleting remote file '{}': {}".format(external_file.link, ex)
+                            )
 
     @classmethod
     def rename(
@@ -1482,6 +1529,8 @@ class Dataset(object):
         :param dataset_project: The project the datasets to be renamed belongs to
         :param dataset_name: The name of the datasets (before renaming)
         """
+        if Dataset.is_offline():
+            raise ValueError("Cannot rename dataset in offline mode")
         if not bool(Session.check_min_api_server_version(cls.__min_api_version)):
             LoggerRoot.get_base_logger().warning(
                 "Could not rename dataset because API version < {}".format(cls.__min_api_version)
@@ -1527,6 +1576,8 @@ class Dataset(object):
         :param dataset_project: Project of the dataset(s) to move to new project
         :param dataset_name: Name of the dataset(s) to move to new project
         """
+        if cls.is_offline():
+            raise ValueError("Cannot move dataset project in offlime mode")
         if not bool(Session.check_min_api_server_version(cls.__min_api_version)):
             LoggerRoot.get_base_logger().warning(
                 "Could not move dataset to another project because API version < {}".format(cls.__min_api_version)
@@ -1601,6 +1652,9 @@ class Dataset(object):
 
         :return: Dataset object
         """
+        if Dataset.is_offline():
+            raise ValueError("Cannot get dataset in offline mode.")
+
         system_tags = ["__$all", cls.__tag]
         if not include_archived:
             system_tags = ["__$all", cls.__tag, "__$not", "archived"]
@@ -1740,6 +1794,7 @@ class Dataset(object):
         """
         Return a Logger object for the Dataset, allowing users to report statistics metrics
         and debug samples on the Dataset itself
+
         :return: Logger object
         """
         return self._task.get_logger()
@@ -1751,8 +1806,8 @@ class Dataset(object):
         (it does not imply on the number of chunks parent versions store)
 
         :param include_parents: If True (default),
-        return the total number of chunks from this version and all parent versions.
-        If False, only return the number of chunks we stored on this specific version.
+            return the total number of chunks from this version and all parent versions.
+            If False, only return the number of chunks we stored on this specific version.
 
         :return: Number of chunks stored on the dataset.
         """
@@ -1776,7 +1831,7 @@ class Dataset(object):
         If a set of versions are given it will squash the versions diff into a single version
 
         :param dataset_name: Target name for the newly generated squashed dataset
-        :param dataset_ids: List of dataset Ids (or objects) to squash. Notice order does matter.
+        :param dataset_ids: List of dataset IDs (or objects) to squash. Notice order does matter.
             The versions are merged from first to last.
         :param dataset_project_name_pairs: List of pairs (project_name, dataset_name) to squash.
             Notice order does matter. The versions are merged from first to last.
@@ -1784,6 +1839,9 @@ class Dataset(object):
             Examples: `s3://bucket/data`, `gs://bucket/data` , `azure://bucket/data` , `/mnt/share/data`
         :return: Newly created dataset object.
         """
+        if Dataset.is_offline():
+            raise ValueError("Cannot squash datasets in offline mode")
+
         mutually_exclusive(dataset_ids=dataset_ids, dataset_project_name_pairs=dataset_project_name_pairs)
         datasets = [cls.get(dataset_id=d) for d in dataset_ids] if dataset_ids else \
             [cls.get(dataset_project=pair[0], dataset_name=pair[1]) for pair in dataset_project_name_pairs]
@@ -1825,22 +1883,31 @@ class Dataset(object):
         ids=None,  # type: Optional[Sequence[str]]
         only_completed=True,  # type: bool
         recursive_project_search=True,  # type: bool
+        include_archived=True,  # type: bool
     ):
         # type: (...) -> List[dict]
         """
         Query list of dataset in the system
 
         :param dataset_project: Specify dataset project name
-        :param partial_name: Specify partial match to a dataset name
+        :param partial_name: Specify partial match to a dataset name. This method supports regular expressions for name
+            matching (if you wish to match special characters and avoid any regex behaviour, use re.escape())
         :param tags: Specify user tags
         :param ids: List specific dataset based on IDs list
-        :param only_completed: If False return datasets that are still in progress (uploading/edited etc.)
+        :param only_completed: If False, return datasets that are still in progress (uploading/edited etc.)
         :param recursive_project_search: If True and the `dataset_project` argument is set,
             search inside subprojects as well.
             If False, don't search inside subprojects (except for the special `.datasets` subproject)
+        :param include_archived: If True, include archived datasets as well.
         :return: List of dictionaries with dataset information
             Example: [{'name': name, 'project': project name, 'id': dataset_id, 'created': date_created},]
         """
+        # if include_archived is False, we need to add the system tag __$not:archived to filter out archived datasets
+        if not include_archived:
+            system_tags = ["__$all", cls.__tag, "__$not", "archived"]
+        else:
+            system_tags = [cls.__tag]
+
         if dataset_project:
             if not recursive_project_search:
                 dataset_projects = [
@@ -1851,16 +1918,17 @@ class Dataset(object):
                 dataset_projects = [exact_match_regex(dataset_project), "^{}/.*".format(re.escape(dataset_project))]
         else:
             dataset_projects = None
+
         # noinspection PyProtectedMember
         datasets = Task._query_tasks(
             task_ids=ids or None,
             project_name=dataset_projects,
             task_name=partial_name,
-            system_tags=[cls.__tag],
+            system_tags=system_tags,
             type=[str(Task.TaskTypes.data_processing)],
             tags=tags or None,
             status=["stopped", "published", "completed", "closed"] if only_completed else None,
-            only_fields=["created", "id", "name", "project", "tags"],
+            only_fields=["created", "id", "name", "project", "tags", "runtime"],
             search_hidden=True,
             exact_match_regex_flag=False,
             _allow_extra_fields_=True,
@@ -1875,6 +1943,7 @@ class Dataset(object):
                 "project": cls._remove_hidden_part_from_dataset_project(project_id_lookup[d.project]),
                 "id": d.id,
                 "tags": d.tags,
+                "version": d.runtime.get("version")
             }
             for d in datasets
         ]
@@ -2011,6 +2080,10 @@ class Dataset(object):
             for k, parents in self._dependency_graph.items() if k in used_dataset_versions}
         # make sure we do not remove our parents, for geology sake
         self._dependency_graph[self._id] = current_parents
+        if not Dataset.is_offline():
+            to_delete = [k for k in self._dependency_graph.keys() if k.startswith("offline-")]
+            for k in to_delete:
+                del self._dependency_graph[k]
 
     def _serialize(self, update_dependency_chunk_lookup=False):
         # type: (bool) -> ()
@@ -2187,12 +2260,12 @@ class Dataset(object):
             max_workers=max_workers
         )
         self._download_external_files(
-            target_folder=target_folder, lock_target_folder=lock_target_folder
+            target_folder=target_folder, lock_target_folder=lock_target_folder, max_workers=max_workers
         )
         return local_folder
 
     def _download_external_files(
-        self, target_folder=None, lock_target_folder=False
+        self, target_folder=None, lock_target_folder=False, max_workers=None
     ):
         # (Union(Path, str), bool) -> None
         """
@@ -2204,6 +2277,7 @@ class Dataset(object):
         :param target_folder: If provided use the specified target folder, default, auto generate from Dataset ID.
         :param lock_target_folder: If True, local the target folder so the next cleanup will not delete
             Notice you should unlock it manually, or wait for the process to finish for auto unlocking.
+        :param max_workers: Number of threads to be spawned when getting dataset files. Defaults to no multi-threading.
         """
         target_folder = (
             Path(target_folder)
@@ -2220,15 +2294,15 @@ class Dataset(object):
             ds = Dataset.get(dependency)
             links.update(ds._dataset_link_entries)
         links.update(self._dataset_link_entries)
-        for relative_path, link in links.items():
-            target_path = os.path.join(target_folder, relative_path)
+
+        def _download_link(link, target_path):
             if os.path.exists(target_path):
                 LoggerRoot.get_base_logger().info(
                     "{} already exists. Skipping downloading {}".format(
                         target_path, link
                     )
                 )
-                continue
+                return
             ok = False
             error = None
             try:
@@ -2250,6 +2324,15 @@ class Dataset(object):
                 LoggerRoot.get_base_logger().info(log_string)
             else:
                 link.size = Path(target_path).stat().st_size
+        if not max_workers:
+            for relative_path, link in links.items():
+                target_path = os.path.join(target_folder, relative_path)
+                _download_link(link, target_path)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                for relative_path, link in links.items():
+                    target_path = os.path.join(target_folder, relative_path)
+                    pool.submit(_download_link, link, target_path)
 
     def _extract_dataset_archive(
             self,
@@ -2579,6 +2662,90 @@ class Dataset(object):
         """
         return 'dsh{}'.format(md5text(dataset_id))
 
+    @classmethod
+    def is_offline(cls):
+        # type: () -> bool
+        """
+        Return offline-mode state, If in offline-mode, no communication to the backend is enabled.
+
+        :return: boolean offline-mode state
+        """
+        return Task.is_offline()
+
+    @classmethod
+    def set_offline(cls, offline_mode=False):
+        # type: (bool) -> None
+        """
+        Set offline mode, where all data and logs are stored into local folder, for later transmission
+
+        :param offline_mode: If True, offline-mode is turned on, and no communication to the backend is enabled.
+        """
+        Task.set_offline(offline_mode=offline_mode)
+
+    def get_offline_mode_folder(self):
+        # type: () -> Optional[Path]
+        """
+        Return the folder where all the dataset data is stored in the offline session.
+
+        :return: Path object, local folder
+        """
+        return self._task.get_offline_mode_folder()
+
+    @classmethod
+    def import_offline_session(cls, session_folder_zip, upload=True, finalize=False):
+        # type: (str, bool, bool) -> str
+        """
+        Import an offline session of a dataset.
+        Includes repository details, installed packages, artifacts, logs, metric and debug samples.
+
+        :param session_folder_zip: Path to a folder containing the session, or zip-file of the session folder.
+        :param upload: If True, upload the dataset's data
+        :param finalize: If True, finalize the dataset
+
+        :return: The ID of the imported dataset
+        """
+        id = Task.import_offline_session(session_folder_zip)
+        dataset = Dataset.get(dataset_id=id)
+        # note that there can only be one offline session in the dependency graph: our session
+        # noinspection PyProtectedMember
+        dataset._dependency_graph = {
+            (id if k.startswith("offline-") else k): [(id if sub_v.startswith("offline-") else sub_v) for sub_v in v]
+            for k, v in dataset._dependency_graph.items()  # noqa
+        }
+        # noinspection PyProtectedMember
+        dataset._update_dependency_graph()
+        # noinspection PyProtectedMember
+        dataset._log_dataset_page()
+
+        started = False
+        if upload or finalize:
+            started = True
+            # noinspection PyProtectedMember
+            dataset._task.mark_started(force=True)
+
+        if upload:
+            dataset.upload()
+        if finalize:
+            dataset.finalize()
+
+        if started:
+            # noinspection PyProtectedMember
+            dataset._task.mark_completed()
+
+        return id
+
+    def _log_dataset_page(self):
+        if bool(Session.check_min_api_server_version(self.__min_api_version)):
+            self._task.get_logger().report_text(
+                "ClearML dataset page: {}".format(
+                    "{}/datasets/simple/{}/experiments/{}".format(
+                        self._task._get_app_server(),
+                        self._task.project if self._task.project is not None else "*",
+                        self._task.id,
+                    )
+                )
+            )
+
     def _build_dependency_chunk_lookup(self):
         # type: () -> Dict[str, int]
         """
@@ -2820,7 +2987,10 @@ class Dataset(object):
             dependency_graph_ex[id_] = parents
 
             task = Task.get_task(task_id=id_)
-            dataset_struct_entry = {"job_id": id_, "status": task.status}
+            dataset_struct_entry = {
+                "job_id": id_[len("offline-"):] if id_.startswith("offline-") else id_,  # .removeprefix not supported < Python 3.9
+                "status": task.status
+            }
             # noinspection PyProtectedMember
             last_update = task._get_last_update()
             if last_update:
@@ -2917,12 +3087,15 @@ class Dataset(object):
             if artifact is not None:
                 # noinspection PyBroadException
                 try:
-                    # we do not use report_table if default_upload_destination is set because it will
-                    # not upload the sample to that destination, use report_media instead
-                    if isinstance(artifact, pd.DataFrame) and not self._task.get_logger().get_default_upload_destination():
-                        self._task.get_logger().report_table(
-                            "Tables", "summary", table_plot=artifact
-                        )
+                    # we only use report_table if default_upload_destination is not set
+                    # (it is the same as the file server)
+                    # because it will not upload the sample to that destination.
+                    # use report_media instead to not leak data
+                    if (
+                        isinstance(artifact, pd.DataFrame)
+                        and self._task.get_logger().get_default_upload_destination() == Session.get_files_server_host()
+                    ):
+                        self._task.get_logger().report_table("Tables", "summary", table_plot=artifact)
                     else:
                         self._task.get_logger().report_media(
                             "Tables", file_name, stream=artifact.to_csv(index=False), file_extension=".txt"
@@ -2931,7 +3104,7 @@ class Dataset(object):
                 except Exception:
                     pass
                 continue
-            if compression:
+            if compression or os.path.getsize(file_path) > self.__preview_media_max_file_size:
                 continue
             guessed_type = mimetypes.guess_type(file_path)
             if not guessed_type or not guessed_type[0]:
@@ -2949,6 +3122,9 @@ class Dataset(object):
             elif guessed_type == "text/html" and self.__preview_html_count < self.__preview_media_html_count:
                 self._task.get_logger().report_media("HTML", file_name, local_path=file_path)
                 self.__preview_html_count += 1
+            elif guessed_type == "application/json" and self.__preview_json_count < self.__preview_media_json_count:
+                self._task.get_logger().report_media("JSON", file_name, local_path=file_path, file_extension=".txt")
+                self.__preview_json_count += 1
 
     @classmethod
     def _set_project_system_tags(cls, task):
@@ -3333,7 +3509,7 @@ class Dataset(object):
         if not dataset_project:
             return None, None
         project_name = cls._remove_hidden_part_from_dataset_project(dataset_project)
-        if bool(Session.check_min_api_server_version(cls.__min_api_version)):
+        if Dataset.is_offline() or bool(Session.check_min_api_server_version(cls.__min_api_version)):
             parent_project = "{}.datasets".format(dataset_project + "/" if dataset_project else "")
             if dataset_name:
                 project_name = "{}/{}".format(parent_project, dataset_name)

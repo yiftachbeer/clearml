@@ -4,10 +4,12 @@ from copy import copy
 from datetime import datetime
 from functools import partial
 from tempfile import gettempdir, mkdtemp
+from urllib.parse import urlparse
 
 import attr
 import logging
 import json
+import requests
 from pathlib2 import Path
 from threading import Thread
 
@@ -88,6 +90,12 @@ class ScriptRequirements(object):
             sklearn = modules.pop('sklearn', {})
             for fname, lines in sklearn.items():
                 modules.add('scikit_learn', fname, lines)
+
+        # bugfix, replace sklearn with scikit-learn name
+        if 'skimage' in modules:
+            skimage = modules.pop('skimage', {})
+            for fname, lines in skimage.items():
+                modules.add('scikit_image', fname, lines)
 
         # if we have torch and it supports tensorboard, we should add that as well
         # (because it will not be detected automatically)
@@ -253,16 +261,20 @@ class ScriptRequirements(object):
 
     @staticmethod
     def _remove_package_versions(installed_pkgs, package_names_to_remove_version):
-        installed_pkgs = {k: (v[0], None if str(k) in package_names_to_remove_version else v[1])
-                          for k, v in installed_pkgs.items()}
+        def _internal(_installed_pkgs):
+            return {
+                k: (v[0], None if str(k) in package_names_to_remove_version else v[1])
+                if not isinstance(v, dict) else _internal(v)
+                for k, v in _installed_pkgs.items()
+            }
 
-        return installed_pkgs
+        return _internal(installed_pkgs)
 
 
 class _JupyterObserver(object):
     _thread = None
-    _exit_event = SafeEvent()
-    _sync_event = SafeEvent()
+    _exit_event = None
+    _sync_event = None
     _sample_frequency = 30.
     _first_sample_frequency = 3.
     _jupyter_history_logger = None
@@ -274,6 +286,10 @@ class _JupyterObserver(object):
 
     @classmethod
     def observer(cls, jupyter_notebook_filename, notebook_name=None, log_history=False):
+        if cls._exit_event is None:
+            cls._exit_event = SafeEvent()
+        if cls._sync_event is None:
+            cls._sync_event = SafeEvent()
         if cls._thread is not None:
             # order of signaling is important!
             cls._exit_event.set()
@@ -292,6 +308,8 @@ class _JupyterObserver(object):
 
     @classmethod
     def signal_sync(cls, *_, **__):
+        if cls._sync_event is None:
+            return
         cls._sync_event.set()
 
     @classmethod
@@ -536,6 +554,8 @@ class _JupyterObserver(object):
 
 
 class ScriptInfo(object):
+    _sagemaker_metadata_path = "/opt/ml/metadata/resource-metadata.json"
+
     max_diff_size_bytes = 500000
 
     plugins = [GitEnvDetector(), HgEnvDetector(), HgDetector(), GitDetector()]
@@ -623,7 +643,6 @@ class ScriptInfo(object):
             except Exception:
                 pass
 
-            import requests
             current_kernel = sys.argv[2].split(os.path.sep)[-1].replace('kernel-', '').replace('.json', '')
 
             notebook_path = None
@@ -649,7 +668,8 @@ class ScriptInfo(object):
                                       data={'_xsrf': cookies['_xsrf'], 'password': password})
                     cookies.update(r.cookies)
 
-                auth_token = server_info.get('token') or os.getenv('JUPYTERHUB_API_TOKEN') or ''
+                # get api token from ENV - if not defined then from server info
+                auth_token = os.getenv('JUPYTERHUB_API_TOKEN') or server_info.get('token') or ''
                 try:
                     r = requests.get(
                         url=server_info['url'] + 'api/sessions', cookies=cookies,
@@ -672,7 +692,7 @@ class ScriptInfo(object):
                     r.raise_for_status()
                 except Exception as ex:
                     # raise on last one only
-                    if server_index == len(jupyter_servers)-1:
+                    if server_index == len(jupyter_servers) - 1:
                         cls._get_logger().warning('Failed accessing the jupyter server{}: {}'.format(
                             ' [password={}]'.format(password) if server_info.get('password') else '', ex))
                         return os.path.join(os.getcwd(), 'error_notebook_not_found.py')
@@ -692,6 +712,9 @@ class ScriptInfo(object):
                 notebook_name = cur_notebook['notebook'].get('name', '')
                 if notebook_path:
                     break
+
+            if (not notebook_name or not notebook_path) and ScriptInfo.is_sagemaker():
+                notebook_path, notebook_name = ScriptInfo._get_sagemaker_notebook(current_kernel)
 
             is_google_colab = False
             log_history = False
@@ -763,6 +786,37 @@ class ScriptInfo(object):
             return script_entry_point
         except Exception:
             return None
+
+    @classmethod
+    def is_sagemaker(cls):
+        return Path(cls._sagemaker_metadata_path).is_file()
+
+    @classmethod
+    def _get_sagemaker_notebook(cls, current_kernel, timeout=30):
+        # noinspection PyBroadException
+        try:
+            # we expect to find boto3 in the sagemaker env
+            import boto3
+
+            with open(cls._sagemaker_metadata_path) as f:
+                notebook_data = json.load(f)
+            client = boto3.client("sagemaker")
+            response = client.create_presigned_domain_url(
+                DomainId=notebook_data["DomainId"],
+                UserProfileName=notebook_data["UserProfileName"]
+            )
+            authorized_url = response["AuthorizedUrl"]
+            authorized_url_parsed = urlparse(authorized_url)
+            unauthorized_url = authorized_url_parsed.scheme + "://" + authorized_url_parsed.netloc
+            with requests.Session() as s:
+                s.get(authorized_url, timeout=timeout)
+                jupyter_sessions = s.get(unauthorized_url + "/jupyter/default/api/sessions", timeout=timeout).json()
+            for jupyter_session in jupyter_sessions:
+                if jupyter_session.get("kernel", {}).get("id") == current_kernel:
+                    return jupyter_session.get("path", ""), jupyter_session.get("name", "")
+        except Exception as e:
+            cls._get_logger().warning("Failed finding Notebook in SageMaker environment. Error is: '{}'".format(e))
+        return None, None
 
     @classmethod
     def _get_colab_notebook(cls, timeout=30):
@@ -944,10 +998,13 @@ class ScriptInfo(object):
                 diff = cls._get_script_code(script_path.as_posix()) \
                     if not plugin or not repo_info.commit else repo_info.diff
 
+            if VCS_DIFF.exists():
+                diff = VCS_DIFF.get() or ""
+
             # make sure diff is not too big:
             if len(diff) > cls.max_diff_size_bytes:
                 messages.append(
-                    "======> WARNING! Git diff to large to store "
+                    "======> WARNING! Git diff too large to store "
                     "({}kb), skipping uncommitted changes <======".format(len(diff)//1024))
                 auxiliary_git_diff = diff
                 diff = '# WARNING! git diff too large to store, clear this section to execute without it.\n' \

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import six
+import warnings
 from copy import copy, deepcopy
 from datetime import datetime
 from logging import getLogger
@@ -22,14 +23,16 @@ from .. import Logger
 from ..automation import ClearmlJob
 from ..backend_api import Session
 from ..backend_interface.task.populate import CreateFromFunction
-from ..backend_interface.util import get_or_create_project, exact_match_regex
+from ..backend_interface.util import get_or_create_project, mutually_exclusive
 from ..config import get_remote_task_id
 from ..debugging.log import LoggerRoot
+from ..errors import UsageError
 from ..model import BaseModel, OutputModel
 from ..storage.util import hash_dict
 from ..task import Task
 from ..utilities.process.mp import leave_process
 from ..utilities.proxy_object import LazyEvalWrapper, flatten_dictionary, walk_nested_dict_tuple_list
+from ..utilities.version import Version
 
 
 class PipelineController(object):
@@ -62,8 +65,10 @@ class PipelineController(object):
     _add_to_evaluated_return_values = {}  # TID: bool
     _retries = {}  # Node.name: int
     _retries_callbacks = {}  # Node.name: Callable[[PipelineController, PipelineController.Node, int], bool]  # noqa
+    _status_change_callbacks = {}  # Node.name: Callable[PipelineController, PipelineController.Node, str]
     _final_failure = {}  # Node.name: bool
     _task_template_header = CreateFromFunction.default_task_template_header
+    _default_pipeline_version = "1.0.0"
 
     valid_job_status = ["failed", "cached", "completed", "aborted", "queued", "running", "skipped", "pending"]
 
@@ -93,6 +98,9 @@ class PipelineController(object):
         monitor_metrics = attrib(type=list, default=None)  # List of metric title/series to monitor
         monitor_artifacts = attrib(type=list, default=None)  # List of artifact names to monitor
         monitor_models = attrib(type=list, default=None)  # List of models to monitor
+        explicit_docker_image = attrib(type=str, default=None)  # The Docker image the node uses, specified at creation
+        recursively_parse_parameters = attrib(type=bool, default=False)  # if True, recursively parse parameters in
+        # lists, dicts, or tuples
 
         def __attrs_post_init__(self):
             if self.parents is None:
@@ -130,11 +138,11 @@ class PipelineController(object):
             self,
             name,  # type: str
             project,  # type: str
-            version,  # type: str
+            version=None,  # type: Optional[str]
             pool_frequency=0.2,  # type: float
             add_pipeline_tags=False,  # type: bool
             target_project=True,  # type: Optional[Union[str, bool]]
-            auto_version_bump=True,  # type: bool
+            auto_version_bump=None,  # type: Optional[bool]
             abort_on_failure=False,  # type: bool
             add_run_number=True,  # type: bool
             retry_on_failure=None,  # type: Optional[Union[int, Callable[[PipelineController, PipelineController.Node, int], bool]]]   # noqa
@@ -144,7 +152,10 @@ class PipelineController(object):
             packages=None,  # type: Optional[Union[str, Sequence[str]]]
             repo=None,  # type: Optional[str]
             repo_branch=None,  # type: Optional[str]
-            repo_commit=None  # type: Optional[str]
+            repo_commit=None,  # type: Optional[str]
+            always_create_from_code=True,  # type: bool
+            artifact_serialization_function=None,  # type: Optional[Callable[[Any], Union[bytes, bytearray]]]
+            artifact_deserialization_function=None  # type: Optional[Callable[[bytes], Any]]
     ):
         # type: (...) -> None
         """
@@ -152,14 +163,16 @@ class PipelineController(object):
 
         :param name: Provide pipeline name (if main Task exists it overrides its name)
         :param project: Provide project storing the pipeline (if main Task exists  it overrides its project)
-        :param version: Must provide pipeline version. This version allows to uniquely identify the pipeline
-            template execution. Examples for semantic versions: version='1.0.1' , version='23', version='1.2'
+        :param version: Pipeline version. This version allows to uniquely identify the pipeline
+            template execution. Examples for semantic versions: version='1.0.1' , version='23', version='1.2'.
+            If not set, find the latest version of the pipeline and increment it. If no such version is found,
+            default to '1.0.0'
         :param float pool_frequency: The pooling frequency (in minutes) for monitoring experiments / states.
         :param bool add_pipeline_tags: (default: False) if True, add `pipe: <pipeline_task_id>` tag to all
             steps (Tasks) created by this pipeline.
         :param str target_project: If provided, all pipeline steps are cloned into the target project.
             If True, pipeline steps are stored into the pipeline project
-        :param bool auto_version_bump: If True (default), if the same pipeline version already exists
+        :param bool auto_version_bump: (Deprecated) If True, if the same pipeline version already exists
             (with any difference from the current one), the current pipeline version will be bumped to a new version
             version bump examples: 1.0.0 -> 1.0.1 , 1.2 -> 1.3, 10 -> 11 etc.
         :param bool abort_on_failure: If False (default), failed pipeline steps will not cause the pipeline
@@ -171,14 +184,15 @@ class PipelineController(object):
         :param add_run_number: If True (default), add the run number of the pipeline to the pipeline name.
             Example, the second time we launch the pipeline "best pipeline", we rename it to "best pipeline #2"
         :param retry_on_failure: Integer (number of retries) or Callback function that returns True to allow a retry
-            - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
-            - Callable: A function called on node failure. Takes as parameters:
-                the PipelineController instance, the PipelineController.Node that failed and an int
-                representing the number of previous retries for the node that failed
-                The function must return a `bool`: True if the node should be retried and False otherwise.
-                If True, the node will be re-queued and the number of retries left will be decremented by 1.
-                By default, if this callback is not specified, the function will be retried the number of
-                times indicated by `retry_on_failure`.
+
+          - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
+          - Callable: A function called on node failure. Takes as parameters:
+              the PipelineController instance, the PipelineController.Node that failed and an int
+              representing the number of previous retries for the node that failed.
+              The function must return ``True`` if the node should be retried and ``False`` otherwise.
+              If True, the node will be re-queued and the number of retries left will be decremented by 1.
+              By default, if this callback is not specified, the function will be retried the number of
+              times indicated by `retry_on_failure`.
 
                 .. code-block:: py
 
@@ -201,19 +215,47 @@ class PipelineController(object):
             Example remote url: 'https://github.com/user/repo.git'
             Example local repo copy: './repo' -> will automatically store the remote
             repo url and commit ID based on the locally cloned copy
+            Use empty string ("") to disable any repository auto-detection
         :param repo_branch: Optional, specify the remote repository branch (Ignored, if local repo path is used)
-        :param repo_commit: Optional, specify the repository commit id (Ignored, if local repo path is used)
+        :param repo_commit: Optional, specify the repository commit ID (Ignored, if local repo path is used)
+        :param always_create_from_code: If True (default) the pipeline is always constructed from code,
+            if False, pipeline is generated from pipeline configuration section on the pipeline Task itsef.
+            this allows to edit (also add/remove) pipeline steps without changing the original codebase
+        :param artifact_serialization_function: A serialization function that takes one
+            parameter of any type which is the object to be serialized. The function should return
+            a `bytes` or `bytearray` object, which represents the serialized object. All parameter/return
+            artifacts uploaded by the pipeline will be serialized using this function.
+            All relevant imports must be done in this function. For example:
+
+            .. code-block:: py
+
+                def serialize(obj):
+                    import dill
+                    return dill.dumps(obj)
+        :param artifact_deserialization_function: A deserialization function that takes one parameter of type `bytes`,
+            which represents the serialized object. This function should return the deserialized object.
+            All parameter/return artifacts fetched by the pipeline will be deserialized using this function.
+            All relevant imports must be done in this function. For example:
+
+            .. code-block:: py
+
+                def deserialize(bytes_):
+                    import dill
+                    return dill.loads(bytes_)
         """
+        if auto_version_bump is not None:
+            warnings.warn("PipelineController.auto_version_bump is deprecated. It will be ignored", DeprecationWarning)
         self._nodes = {}
         self._running_nodes = []
         self._start_time = None
         self._pipeline_time_limit = None
         self._default_execution_queue = None
-        self._version = str(version).strip()
-        if not self._version or not all(i and i.isnumeric() for i in self._version.split('.')):
+        self._always_create_from_code = bool(always_create_from_code)
+        self._version = str(version).strip() if version else None
+        if self._version and not Version.is_valid_version_string(self._version):
             raise ValueError(
-                "Pipeline version has to be in a semantic version form, "
-                "examples: version='1.0.1', version='1.2', version='23'")
+                "Setting non-semantic dataset version '{}'".format(self._version)
+            )
         self._pool_frequency = pool_frequency * 60.
         self._thread = None
         self._pipeline_args = dict()
@@ -231,10 +273,11 @@ class PipelineController(object):
         self._step_ref_pattern = re.compile(self._step_pattern)
         self._reporting_lock = RLock()
         self._pipeline_task_status_failed = None
-        self._auto_version_bump = bool(auto_version_bump)
         self._mock_execution = False  # used for nested pipelines (eager execution)
         self._pipeline_as_sub_project = bool(Session.check_min_api_server_version("2.17"))
         self._last_progress_update_time = 0
+        self._artifact_serialization_function = artifact_serialization_function
+        self._artifact_deserialization_function = artifact_deserialization_function
         if not self._task:
             task_name = name or project or '{}'.format(datetime.now())
             if self._pipeline_as_sub_project:
@@ -244,6 +287,12 @@ class PipelineController(object):
                 parent_project = None
                 project_name = project or 'Pipelines'
 
+            # if user disabled the auto-repo, we force local script storage (repo="" or repo=False)
+            set_force_local_repo = False
+            if Task.running_locally() and repo is not None and not repo:
+                Task.force_store_standalone_script(force=True)
+                set_force_local_repo = True
+
             self._task = Task.init(
                 project_name=project_name,
                 task_name=task_name,
@@ -251,6 +300,13 @@ class PipelineController(object):
                 auto_resource_monitoring=False,
                 reuse_last_task_id=False
             )
+
+            # if user disabled the auto-repo, set it back to False (just in case)
+            if set_force_local_repo:
+                # noinspection PyProtectedMember
+                self._task._wait_for_repo_detection(timeout=300.)
+                Task.force_store_standalone_script(force=False)
+
             # make sure project is hidden
             if self._pipeline_as_sub_project:
                 get_or_create_project(
@@ -260,7 +316,6 @@ class PipelineController(object):
                     project_id=self._task.project, system_tags=self._project_system_tags)
 
             self._task.set_system_tags((self._task.get_system_tags() or []) + [self._tag])
-            self._task.set_user_properties(version=self._version)
         self._task.set_base_docker(
             docker_image=docker, docker_arguments=docker_args, docker_setup_bash_script=docker_bash_setup_script
         )
@@ -331,6 +386,8 @@ class PipelineController(object):
             cache_executed_step=False,  # type: bool
             base_task_factory=None,  # type: Optional[Callable[[PipelineController.Node], Task]]
             retry_on_failure=None,  # type: Optional[Union[int, Callable[[PipelineController, PipelineController.Node, int], bool]]]   # noqa
+            status_change_callback=None,  # type: Optional[Callable[[PipelineController, PipelineController.Node, str], None]]  # noqa
+            recursively_parse_parameters=False  # type: bool
     ):
         # type: (...) -> bool
         """
@@ -344,18 +401,17 @@ class PipelineController(object):
             The current step in the pipeline will be sent for execution only after all the parent nodes
             have been executed successfully.
         :param parameter_override: Optional parameter overriding dictionary.
-            The dict values can reference a previously executed step using the following form '${step_name}'
-            Examples:
-            - Artifact access
-                parameter_override={'Args/input_file': '${<step_name>.artifacts.<artifact_name>.url}' }
-            - Model access (last model used)
-                parameter_override={'Args/input_file': '${<step_name>.models.output.-1.url}' }
-            - Parameter access
-                parameter_override={'Args/input_file': '${<step_name>.parameters.Args/input_file}' }
-            - Pipeline Task argument (see `Pipeline.add_parameter`)
-                parameter_override={'Args/input_file': '${pipeline.<pipeline_parameter>}' }
-            - Task ID
-                parameter_override={'Args/input_file': '${stage3.id}' }
+            The dict values can reference a previously executed step using the following form '${step_name}'. Examples:
+
+          - Artifact access ``parameter_override={'Args/input_file': '${<step_name>.artifacts.<artifact_name>.url}' }``
+          - Model access (last model used) ``parameter_override={'Args/input_file': '${<step_name>.models.output.-1.url}' }``
+          - Parameter access ``parameter_override={'Args/input_file': '${<step_name>.parameters.Args/input_file}' }``
+          - Pipeline Task argument (see `Pipeline.add_parameter`) ``parameter_override={'Args/input_file': '${pipeline.<pipeline_parameter>}' }``
+          - Task ID ``parameter_override={'Args/input_file': '${stage3.id}' }``
+        :param recursively_parse_parameters: If True, recursively parse parameters from parameter_override in lists, dicts, or tuples.
+            Example:
+            - ``parameter_override={'Args/input_file': ['${<step_name>.artifacts.<artifact_name>.url}', 'file2.txt']}`` will be correctly parsed.
+            - ``parameter_override={'Args/input_file': ('${<step_name_1>.parameters.Args/input_file}', '${<step_name_2>.parameters.Args/input_file}')}`` will be correctly parsed.
         :param configuration_overrides: Optional, override Task configuration objects.
             Expected dictionary of configuration object name and configuration object content.
             Examples:
@@ -363,19 +419,13 @@ class PipelineController(object):
                 {'General': 'configuration file content'}
                 {'OmegaConf': YAML.dumps(full_hydra_dict)}
         :param task_overrides: Optional task section overriding dictionary.
-            The dict values can reference a previously executed step using the following form '${step_name}'
-            Examples:
-            - get the latest commit from a specific branch
-                task_overrides={'script.version_num': '', 'script.branch': 'main'}
-            - match git repository branch to a previous step
-                task_overrides={'script.branch': '${stage1.script.branch}', 'script.version_num': ''}
-            - change container image
-                task_overrides={'container.image': 'nvidia/cuda:11.6.0-devel-ubuntu20.04',
-                                'container.arguments': '--ipc=host'}
-            - match container image to a previous step
-                task_overrides={'container.image': '${stage1.container.image}'}
-            - reset requirements (the agent will use the "requirements.txt" inside the repo)
-                task_overrides={'script.requirements.pip': ""}
+            The dict values can reference a previously executed step using the following form '${step_name}'. Examples:
+
+          - get the latest commit from a specific branch ``task_overrides={'script.version_num': '', 'script.branch': 'main'}``
+          - match git repository branch to a previous step ``task_overrides={'script.branch': '${stage1.script.branch}', 'script.version_num': ''}``
+          - change container image ``task_overrides={'container.image': 'nvidia/cuda:11.6.0-devel-ubuntu20.04', 'container.arguments': '--ipc=host'}``
+          - match container image to a previous step ``task_overrides={'container.image': '${stage1.container.image}'}``
+          - reset requirements (the agent will use the "requirements.txt" inside the repo) ``task_overrides={'script.requirements.pip': ""}``
         :param execution_queue: Optional, the queue to use for executing this specific step.
             If not provided, the task will be sent to the default execution queue, as defined on the class
         :param monitor_metrics: Optional, log the step's metrics on the pipeline Task.
@@ -431,7 +481,7 @@ class PipelineController(object):
                     pass
 
         :param post_execute_callback: Callback function, called when a step (Task) is completed
-            and it other jobs are executed. Allows a user to modify the Task status after completion.
+            and other jobs are executed. Allows a user to modify the Task status after completion.
 
             .. code-block:: py
 
@@ -450,14 +500,15 @@ class PipelineController(object):
         :param base_task_factory: Optional, instead of providing a pre-existing Task,
             provide a Callable function to create the Task (returns Task object)
         :param retry_on_failure: Integer (number of retries) or Callback function that returns True to allow a retry
-            - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
-            - Callable: A function called on node failure. Takes as parameters:
-                the PipelineController instance, the PipelineController.Node that failed and an int
-                representing the number of previous retries for the node that failed
-                The function must return a `bool`: True if the node should be retried and False otherwise.
-                If True, the node will be re-queued and the number of retries left will be decremented by 1.
-                By default, if this callback is not specified, the function will be retried the number of
-                times indicated by `retry_on_failure`.
+
+          - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
+          - Callable: A function called on node failure. Takes as parameters:
+              the PipelineController instance, the PipelineController.Node that failed and an int
+              representing the number of previous retries for the node that failed.
+              The function must return ``True`` if the node should be retried and ``False`` otherwise.
+              If True, the node will be re-queued and the number of retries left will be decremented by 1.
+              By default, if this callback is not specified, the function will be retried the number of
+              times indicated by `retry_on_failure`.
 
                 .. code-block:: py
 
@@ -466,19 +517,27 @@ class PipelineController(object):
                         # allow up to 5 retries (total of 6 runs)
                         return retries < 5
 
+        :param status_change_callback: Callback function, called when the status of a step (Task) changes.
+            Use `node.job` to access the ClearmlJob object, or `node.job.task` to directly access the Task object.
+            The signature of the function must look the following way:
+
+            .. code-block:: py
+
+                def status_change_callback(
+                    pipeline,             # type: PipelineController,
+                    node,                 # type: PipelineController.Node,
+                    previous_status       # type: str
+                ):
+                    pass
+
+
         :return: True if successful
         """
-
         # always store callback functions (even when running remotely)
         if pre_execute_callback:
             self._pre_step_callbacks[name] = pre_execute_callback
         if post_execute_callback:
             self._post_step_callbacks[name] = post_execute_callback
-
-        # when running remotely do nothing, we will deserialize ourselves when we start
-        # if we are not cloning a Task, we assume this step is created from code, not from the configuration
-        if not base_task_factory and clone_base_task and self._has_stored_configuration():
-            return True
 
         self._verify_node_name(name)
 
@@ -519,6 +578,7 @@ class PipelineController(object):
             name=name, base_task_id=base_task_id, parents=parents or [],
             queue=execution_queue, timeout=time_limit,
             parameters=parameter_override or {},
+            recursively_parse_parameters=recursively_parse_parameters,
             configurations=configuration_overrides,
             clone_task=clone_base_task,
             task_overrides=task_overrides,
@@ -533,6 +593,8 @@ class PipelineController(object):
         self._retries_callbacks[name] = retry_on_failure if callable(retry_on_failure) else \
             (functools.partial(self._default_retry_on_failure_callback, max_retries=retry_on_failure)
              if isinstance(retry_on_failure, int) else self._retry_on_failure_callback)
+        if status_change_callback:
+            self._status_change_callbacks[name] = status_change_callback
 
         if self._task and not self._task.running_locally():
             self.update_execution_plot()
@@ -558,7 +620,7 @@ class PipelineController(object):
             docker=None,  # type: Optional[str]
             docker_args=None,  # type: Optional[str]
             docker_bash_setup_script=None,  # type: Optional[str]
-            parents=None,  # type: Optional[Sequence[str]],
+            parents=None,  # type: Optional[Sequence[str]]
             execution_queue=None,  # type: Optional[str]
             monitor_metrics=None,  # type: Optional[List[Union[Tuple[str, str], Tuple[(str, str), (str, str)]]]]
             monitor_artifacts=None,  # type: Optional[List[Union[str, Tuple[str, str]]]]
@@ -569,6 +631,8 @@ class PipelineController(object):
             post_execute_callback=None,  # type: Optional[Callable[[PipelineController, PipelineController.Node], None]]  # noqa
             cache_executed_step=False,  # type: bool
             retry_on_failure=None,  # type: Optional[Union[int, Callable[[PipelineController, PipelineController.Node, int], bool]]]   # noqa
+            status_change_callback=None,  # type: Optional[Callable[[PipelineController, PipelineController.Node, str], None]]  # noqa
+            tags=None  # type: Optional[Union[str, Sequence[str]]]
     ):
         # type: (...) -> bool
         """
@@ -605,7 +669,7 @@ class PipelineController(object):
         :param function: A global function to convert into a standalone Task
         :param function_kwargs: Optional, provide subset of function arguments and default values to expose.
             If not provided automatically take all function arguments & defaults
-            Optional, pass input arguments to the function from other Tasks's output artifact.
+            Optional, pass input arguments to the function from other Tasks' output artifact.
             Example argument named `numpy_matrix` from Task ID `aabbcc` artifact name `answer`:
             {'numpy_matrix': 'aabbcc.answer'}
         :param function_return: Provide a list of names for all the results.
@@ -627,7 +691,7 @@ class PipelineController(object):
             Example local repo copy: './repo' -> will automatically store the remote
             repo url and commit ID based on the locally cloned copy
         :param repo_branch: Optional, specify the remote repository branch (Ignored, if local repo path is used)
-        :param repo_commit: Optional, specify the repository commit id (Ignored, if local repo path is used)
+        :param repo_commit: Optional, specify the repository commit ID (Ignored, if local repo path is used)
         :param helper_functions: Optional, a list of helper functions to make available
             for the standalone function Task.
         :param docker: Select the docker image to be executed in by the remote session
@@ -686,7 +750,7 @@ class PipelineController(object):
                     pass
 
         :param post_execute_callback: Callback function, called when a step (Task) is completed
-            and it other jobs are executed. Allows a user to modify the Task status after completion.
+            and other jobs are executed. Allows a user to modify the Task status after completion.
 
             .. code-block:: py
 
@@ -701,16 +765,16 @@ class PipelineController(object):
             was already executed. If it was found, use it instead of launching a new Task.
             Default: False, a new cloned copy of base_task is always used.
             Notice: If the git repo reference does not have a specific commit ID, the Task will never be used.
-
         :param retry_on_failure: Integer (number of retries) or Callback function that returns True to allow a retry
-            - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
-            - Callable: A function called on node failure. Takes as parameters:
-                the PipelineController instance, the PipelineController.Node that failed and an int
-                representing the number of previous retries for the node that failed
-                The function must return a `bool`: True if the node should be retried and False otherwise.
-                If True, the node will be re-queued and the number of retries left will be decremented by 1.
-                By default, if this callback is not specified, the function will be retried the number of
-                times indicated by `retry_on_failure`.
+
+          - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
+          - Callable: A function called on node failure. Takes as parameters:
+              the PipelineController instance, the PipelineController.Node that failed and an int
+              representing the number of previous retries for the node that failed.
+              The function must return ``True`` if the node should be retried and ``False`` otherwise.
+              If True, the node will be re-queued and the number of retries left will be decremented by 1.
+              By default, if this callback is not specified, the function will be retried the number of
+              times indicated by `retry_on_failure`.
 
                 .. code-block:: py
 
@@ -718,6 +782,23 @@ class PipelineController(object):
                         print(node.name, ' failed')
                         # allow up to 5 retries (total of 6 runs)
                         return retries < 5
+
+        :param status_change_callback: Callback function, called when the status of a step (Task) changes.
+            Use `node.job` to access the ClearmlJob object, or `node.job.task` to directly access the Task object.
+            The signature of the function must look the following way:
+
+            .. code-block:: py
+
+                def status_change_callback(
+                    pipeline,             # type: PipelineController,
+                    node,                 # type: PipelineController.Node,
+                    previous_status       # type: str
+                ):
+                    pass
+
+        :param tags: A list of tags for the specific pipeline step.
+            When executing a Pipeline remotely
+            (i.e. launching the pipeline from the UI/enqueuing it), this method has no effect.
 
         :return: True if successful
         """
@@ -756,6 +837,8 @@ class PipelineController(object):
             post_execute_callback=post_execute_callback,
             cache_executed_step=cache_executed_step,
             retry_on_failure=retry_on_failure,
+            status_change_callback=status_change_callback,
+            tags=tags
         )
 
     def start(
@@ -792,7 +875,7 @@ class PipelineController(object):
                     pass
 
         :param Callable step_task_completed_callback: Callback function, called when a step (Task) is completed
-            and it other jobs are executed. Allows a user to modify the Task status after completion.
+            and other jobs are executed. Allows a user to modify the Task status after completion.
 
             .. code-block:: py
 
@@ -878,6 +961,44 @@ class PipelineController(object):
         self._task.close()
         self._task.reset()
 
+    def connect_configuration(self, configuration, name=None, description=None):
+        # type: (Union[Mapping, list, Path, str], Optional[str], Optional[str]) -> Union[dict, Path, str]
+        """
+        Connect a configuration dictionary or configuration file (pathlib.Path / str) to the PipelineController object.
+        This method should be called before reading the configuration file.
+
+        For example, a local file:
+
+        .. code-block:: py
+
+           config_file = pipe.connect_configuration(config_file)
+           my_params = json.load(open(config_file,'rt'))
+
+        A parameter dictionary/list:
+
+        .. code-block:: py
+
+           my_params = pipe.connect_configuration(my_params)
+
+        :param configuration: The configuration. This is usually the configuration used in the model training process.
+            Specify one of the following:
+
+          - A dictionary/list - A dictionary containing the configuration. ClearML stores the configuration in
+              the **ClearML Server** (backend), in a HOCON format (JSON-like format) which is editable.
+          - A ``pathlib2.Path`` string - A path to the configuration file. ClearML stores the content of the file.
+              A local path must be relative path. When executing a pipeline remotely in a worker, the contents brought
+              from the **ClearML Server** (backend) overwrites the contents of the file.
+
+        :param str name: Configuration section name. default: 'General'
+            Allowing users to store multiple configuration dicts/files
+
+        :param str description: Configuration section description (text). default: None
+
+        :return: If a dictionary is specified, then a dictionary is returned. If pathlib2.Path / string is
+            specified, then a path to a local configuration file is returned. Configuration object.
+        """
+        return self._task.connect_configuration(configuration, name=name, description=description)
+
     @classmethod
     def get_logger(cls):
         # type: () -> Logger
@@ -925,6 +1046,7 @@ class PipelineController(object):
         auto_pickle=True,  # type: bool
         preview=None,  # type: Any
         wait_on_upload=False,  # type: bool
+        serialization_function=None  # type: Optional[Callable[[Any], Union[bytes, bytearray]]]
     ):
         # type: (...) -> bool
         """
@@ -967,6 +1089,13 @@ class PipelineController(object):
         :param bool wait_on_upload: Whether the upload should be synchronous, forcing the upload to complete
             before continuing.
 
+        :param Callable[Any, Union[bytes, bytearray]] serialization_function: A serialization function that takes one
+            parameter of any type which is the object to be serialized. The function should return
+            a `bytes` or `bytearray` object, which represents the serialized object. Note that the object will be
+            immediately serialized using this function, thus other serialization methods will not be used
+            (e.g. `pandas.DataFrame.to_csv`), even if possible. To deserialize this artifact when getting
+            it using the `Artifact.get` method, use its `deserialization_function` argument.
+
         :return: The status of the upload.
 
         - ``True`` - Upload succeeded.
@@ -976,8 +1105,15 @@ class PipelineController(object):
         """
         task = cls._get_pipeline_task()
         return task.upload_artifact(
-            name=name, artifact_object=artifact_object, metadata=metadata, delete_after_upload=delete_after_upload,
-            auto_pickle=auto_pickle, preview=preview, wait_on_upload=wait_on_upload)
+            name=name,
+            artifact_object=artifact_object,
+            metadata=metadata,
+            delete_after_upload=delete_after_upload,
+            auto_pickle=auto_pickle,
+            preview=preview,
+            wait_on_upload=wait_on_upload,
+            serialization_function=serialization_function
+        )
 
     def stop(self, timeout=None, mark_failed=False, mark_aborted=False):
         # type: (Optional[float], bool, bool) -> ()
@@ -1046,14 +1182,38 @@ class PipelineController(object):
         """
         return self._thread is not None and self._thread.is_alive()
 
-    def is_successful(self):
-        # type: () -> bool
+    def is_successful(self, fail_on_step_fail=True, fail_condition="all"):
+        # type: (bool, str) -> bool
         """
-        return True if the pipeline controller is fully executed and none of the steps / Tasks failed
+        Evaluate whether the pipeline is successful.
 
-        :return: A boolean indicating whether all steps did not fail
+        :param fail_on_step_fail: If True (default), evaluate the pipeline steps' status to assess if the pipeline
+            is successful. If False, only evaluate the controller
+        :param fail_condition: Must be one of the following: 'all' (default), 'failed' or 'aborted'. If 'failed', this
+            function will return False if the pipeline failed and True if the pipeline was aborted. If 'aborted',
+            this function will return False if the pipeline was aborted and True if the pipeline failed. If 'all',
+            this function will return False in both cases.
+
+        :return: A boolean indicating whether the pipeline was successful or not. Note that if the pipeline is in a
+            running/pending state, this function will return False
         """
-        return self._thread and not self.is_running() and not self._pipeline_task_status_failed
+        if fail_condition == "all":
+            success_status = [Task.TaskStatusEnum.completed]
+        elif fail_condition == "failed":
+            success_status = [Task.TaskStatusEnum.completed, Task.TaskStatusEnum.stopped]
+        elif fail_condition == "aborted":
+            success_status = [Task.TaskStatusEnum.completed, Task.TaskStatusEnum.failed]
+        else:
+            raise UsageError("fail_condition needs to be one of the following: 'all', 'failed', 'aborted'")
+        if self._task.status not in success_status:
+            return False
+        if not fail_on_step_fail:
+            return True
+        self._update_nodes_status()
+        for node in self._nodes.values():
+            if node.status not in success_status:
+                return False
+        return True
 
     def elapsed(self):
         # type: () -> float
@@ -1129,7 +1289,7 @@ class PipelineController(object):
         :param name: String name of the parameter.
         :param default: Default value to be put as the default value (can be later changed in the UI)
         :param description: String description of the parameter and its usage in the pipeline
-        :param param_type: Optional, parameter type information (to used as hint for casting and description)
+        :param param_type: Optional, parameter type information (to be used as hint for casting and description)
         """
         self._pipeline_args[str(name)] = default
         if description:
@@ -1144,6 +1304,154 @@ class PipelineController(object):
         :return: Dictionary str -> str
         """
         return self._pipeline_args
+
+    @classmethod
+    def enqueue(cls, pipeline_controller, queue_name=None, queue_id=None, force=False):
+        # type: (Union[PipelineController, str], Optional[str], Optional[str], bool) -> Any
+        """
+        Enqueue a PipelineController for execution, by adding it to an execution queue.
+
+        .. note::
+           A worker daemon must be listening at the queue for the worker to fetch the Task and execute it,
+           see `ClearML Agent <../clearml_agent>`_ in the ClearML Documentation.
+
+        :param pipeline_controller: The PipelineController to enqueue. Specify a PipelineController object or PipelineController ID
+        :param queue_name: The name of the queue. If not specified, then ``queue_id`` must be specified.
+        :param queue_id: The ID of the queue. If not specified, then ``queue_name`` must be specified.
+        :param bool force: If True, reset the PipelineController if necessary before enqueuing it
+
+        :return: An enqueue JSON response.
+
+            .. code-block:: javascript
+
+               {
+                    "queued": 1,
+                    "updated": 1,
+                    "fields": {
+                        "status": "queued",
+                        "status_reason": "",
+                        "status_message": "",
+                        "status_changed": "2020-02-24T15:05:35.426770+00:00",
+                        "last_update": "2020-02-24T15:05:35.426770+00:00",
+                        "execution.queue": "2bd96ab2d9e54b578cc2fb195e52c7cf"
+                        }
+                }
+
+            - ``queued``  - The number of Tasks enqueued (an integer or ``null``).
+            - ``updated`` - The number of Tasks updated (an integer or ``null``).
+            - ``fields``
+
+              - ``status`` - The status of the experiment.
+              - ``status_reason`` - The reason for the last status change.
+              - ``status_message`` - Information about the status.
+              - ``status_changed`` - The last status change date and time (ISO 8601 format).
+              - ``last_update`` - The last Task update time, including Task creation, update, change, or events for this task (ISO 8601 format).
+              - ``execution.queue`` - The ID of the queue where the Task is enqueued. ``null`` indicates not enqueued.
+        """
+        pipeline_controller = (
+            pipeline_controller
+            if isinstance(pipeline_controller, PipelineController)
+            else cls.get(pipeline_id=pipeline_controller)
+        )
+        return Task.enqueue(pipeline_controller._task, queue_name=queue_name, queue_id=queue_id, force=force)
+
+    @classmethod
+    def get(
+        cls,
+        pipeline_id=None,  # type: Optional[str]
+        pipeline_project=None,  # type: Optional[str]
+        pipeline_name=None,  # type: Optional[str]
+        pipeline_version=None,  # type: Optional[str]
+        pipeline_tags=None,  # type: Optional[Sequence[str]]
+        shallow_search=False  # type: bool
+    ):
+        # type: (...) -> "PipelineController"
+        """
+        Get a specific PipelineController. If multiple pipeline controllers are found, the pipeline controller
+        with the highest semantic version is returned. If no semantic version is found, the most recently
+        updated pipeline controller is returned. This function raises aan Exception if no pipeline controller
+        was found
+
+        Note: In order to run the pipeline controller returned by this function, use PipelineController.enqueue
+
+        :param pipeline_id: Requested PipelineController ID
+        :param pipeline_project: Requested PipelineController project
+        :param pipeline_name: Requested PipelineController name
+        :param pipeline_tags: Requested PipelineController tags (list of tag strings)
+        :param shallow_search: If True, search only the first 500 results (first page)
+        """
+        mutually_exclusive(pipeline_id=pipeline_id, pipeline_project=pipeline_project, _require_at_least_one=False)
+        mutually_exclusive(pipeline_id=pipeline_id, pipeline_name=pipeline_name, _require_at_least_one=False)
+        if not pipeline_id:
+            pipeline_project_hidden = "{}/.pipelines/{}".format(pipeline_project, pipeline_name)
+            name_with_runtime_number_regex = r"^{}( #[0-9]+)*$".format(re.escape(pipeline_name))
+            pipelines = Task._query_tasks(
+                pipeline_project=[pipeline_project_hidden],
+                task_name=name_with_runtime_number_regex,
+                fetch_only_first_page=False if not pipeline_version else shallow_search,
+                only_fields=["id"] if not pipeline_version else ["id", "runtime.version"],
+                system_tags=[cls._tag],
+                order_by=["-last_update"],
+                tags=pipeline_tags,
+                search_hidden=True,
+                _allow_extra_fields_=True,
+            )
+            if pipelines:
+                if not pipeline_version:
+                    pipeline_id = pipelines[0].id
+                    current_version = None
+                    for pipeline in pipelines:
+                        if not pipeline.runtime:
+                            continue
+                        candidate_version = pipeline.runtime.get("version")
+                        if not candidate_version or not Version.is_valid_version_string(candidate_version):
+                            continue
+                        if not current_version or Version(candidate_version) > current_version:
+                            current_version = Version(candidate_version)
+                            pipeline_id = pipeline.id
+                else:
+                    for pipeline in pipelines:
+                        if pipeline.runtime.get("version") == pipeline_version:
+                            pipeline_id = pipeline.id
+                            break
+            if not pipeline_id:
+                error_msg = "Could not find dataset with pipeline_project={}, pipeline_name={}".format(pipeline_project, pipeline_name)
+                if pipeline_version:
+                    error_msg += ", pipeline_version={}".format(pipeline_version)
+                raise ValueError(error_msg)
+        pipeline_task = Task.get_task(task_id=pipeline_id)
+        pipeline_object = cls.__new__(cls)
+        pipeline_object._task = pipeline_task
+        pipeline_object._nodes = {}
+        pipeline_object._running_nodes = []
+        try:
+            pipeline_object._deserialize(pipeline_task._get_configuration_dict(cls._config_section), force=True)
+        except Exception:
+            pass
+        return pipeline_object
+
+    @property
+    def id(self):
+        # type: () -> str
+        return self._task.id
+
+    @property
+    def tags(self):
+        # type: () -> List[str]
+        return self._task.get_tags() or []
+
+    def add_tags(self, tags):
+        # type: (Union[Sequence[str], str]) -> None
+        """
+        Add tags to this pipeline. Old tags are not deleted.
+        When executing a Pipeline remotely
+        (i.e. launching the pipeline from the UI/enqueuing it), this method has no effect.
+
+        :param tags: A list of tags for this pipeline.
+        """
+        if not self._task:
+            return  # should not actually happen
+        self._task.add_tags(tags)
 
     def _create_task_from_function(
             self, docker, docker_args, docker_bash_setup_script,
@@ -1171,7 +1479,9 @@ class PipelineController(object):
             output_uri=None,
             helper_functions=helper_functions,
             dry_run=True,
-            task_template_header=self._task_template_header
+            task_template_header=self._task_template_header,
+            artifact_serialization_function=self._artifact_serialization_function,
+            artifact_deserialization_function=self._artifact_deserialization_function
         )
         return task_definition
 
@@ -1207,7 +1517,7 @@ class PipelineController(object):
                     pass
 
         :param Callable step_task_completed_callback: Callback function, called when a step (Task) is completed
-            and it other jobs are executed. Allows a user to modify the Task status after completion.
+            and other jobs are executed. Allows a user to modify the Task status after completion.
 
             .. code-block:: py
 
@@ -1311,7 +1621,7 @@ class PipelineController(object):
 
                 # make sure we have a unique version number (auto bump version if needed)
                 # only needed when manually (from code) creating pipelines
-                self._verify_pipeline_version()
+                self._handle_pipeline_version()
 
                 # noinspection PyProtectedMember
                 pipeline_hash = self._get_task_hash()
@@ -1319,6 +1629,7 @@ class PipelineController(object):
                 # noinspection PyProtectedMember
                 self._task._set_runtime_properties({
                     self._runtime_property_hash: "{}:{}".format(pipeline_hash, self._version),
+                    "version": self._version
                 })
             else:
                 self._task.connect_configuration(pipeline_dag, name=self._config_section)
@@ -1350,74 +1661,25 @@ class PipelineController(object):
 
         return params, pipeline_dag
 
-    def _verify_pipeline_version(self):
-        # if no version bump needed, just set the property
-        if not self._auto_version_bump:
-            self._task.set_user_properties(version=self._version)
-            return
-
-        # check if pipeline version exists, if it does increase version
-        pipeline_hash = self._get_task_hash()
-        # noinspection PyProtectedMember
-        existing_tasks = Task._query_tasks(
-            project=[self._task.project], task_name=exact_match_regex(self._task.name),
-            type=[str(self._task.task_type)],
-            system_tags=["__$all", self._tag, "__$not", Task.archived_tag],
-            _all_=dict(fields=['runtime.{}'.format(self._runtime_property_hash)],
-                       pattern=":{}".format(self._version)),
-            only_fields=['id', 'runtime'],
-        )
-        if existing_tasks:
-            # check if hash match the current version.
-            matched = True
-            for t in existing_tasks:
-                h, _, v = t.runtime.get(self._runtime_property_hash, '').partition(':')
-                if v == self._version:
-                    matched = bool(h == pipeline_hash)
-                    break
-            # if hash did not match, look for the highest version
-            if not matched:
-                # noinspection PyProtectedMember
-                existing_tasks = Task._query_tasks(
-                    project=[self._task.project], task_name=exact_match_regex(self._task.name),
-                    type=[str(self._task.task_type)],
-                    system_tags=["__$all", self._tag, "__$not", Task.archived_tag],
-                    only_fields=['id', 'hyperparams', 'runtime'],
+    def _handle_pipeline_version(self):
+        if not self._version:
+            # noinspection PyProtectedMember
+            self._version = self._task._get_runtime_properties().get("version")
+            if not self._version:
+                previous_pipeline_tasks = Task._query_tasks(
+                    project=[self._task.project],
+                    fetch_only_first_page=True,
+                    only_fields=["runtime.version"],
+                    order_by=["-last_update"],
+                    system_tags=[self._tag],
+                    search_hidden=True,
+                    _allow_extra_fields_=True
                 )
-                found_match_version = False
-                existing_versions = set([self._version])  # noqa
-                for t in existing_tasks:
-                    # exclude ourselves
-                    if t.id == self._task.id:
-                        continue
-                    if not t.hyperparams:
-                        continue
-                    v = t.hyperparams.get('properties', {}).get('version')
-                    if v:
-                        existing_versions.add(v.value)
-                    if t.runtime:
-                        h, _, _ = t.runtime.get(self._runtime_property_hash, '').partition(':')
-                        if h == pipeline_hash:
-                            self._version = v.value
-                            found_match_version = True
-                            break
-
-                # match to the version we found:
-                if found_match_version:
-                    getLogger('clearml.automation.controller').info(
-                        'Existing Pipeline found, matching version to: {}'.format(self._version))
-                else:
-                    # if we did not find a matched pipeline version, get the max one and bump the version by 1
-                    while True:
-                        v = self._version.split('.')
-                        self._version = '.'.join(v[:-1] + [str(int(v[-1]) + 1)])
-                        if self._version not in existing_versions:
-                            break
-
-                    getLogger('clearml.automation.controller').info(
-                        'No matching Pipelines found, bump new version to: {}'.format(self._version))
-
-            self._task.set_user_properties(version=self._version)
+                for previous_pipeline_task in previous_pipeline_tasks:
+                    if previous_pipeline_task.runtime.get("version"):
+                        self._version = str(Version(previous_pipeline_task.runtime.get("version")).get_next_version())
+                        break
+        self._version = self._version or self._default_pipeline_version
 
     def _get_task_hash(self):
         params_override = dict(**(self._task.get_parameters() or {}))
@@ -1465,13 +1727,16 @@ class PipelineController(object):
 
         return dag
 
-    def _deserialize(self, dag_dict):
-        # type: (dict) -> ()
+    def _deserialize(self, dag_dict, force=False):
+        # type: (dict, bool) -> ()
         """
         Restore the DAG from a dictionary.
         This will be used to create the DAG from the dict stored on the Task, when running remotely.
         :return:
         """
+        # if we always want to load the pipeline DAG from code, we are skipping the deserialization step
+        if not force and self._always_create_from_code:
+            return
 
         # if we do not clone the Task, only merge the parts we can override.
         for name in list(self._nodes.keys()):
@@ -1497,7 +1762,7 @@ class PipelineController(object):
 
     def _has_stored_configuration(self):
         """
-        Return True if we are running remotely and we have stored configuration on the Task
+        Return True if we are running remotely, and we have stored configuration on the Task
         """
         if self._auto_connect_task and self._task and not self._task.running_locally() and self._task.is_main_task():
             stored_config = self._task.get_configuration_object(self._config_section)
@@ -1580,9 +1845,10 @@ class PipelineController(object):
                 conformed_monitors = [
                     pair if isinstance(pair[0], (list, tuple)) else (pair, pair) for pair in monitors
                 ]
-                # verify pair of pairs
+                # verify the pair of pairs
                 if not all(isinstance(x[0][0], str) and isinstance(x[0][1], str) and
-                           isinstance(x[1][0], str) and isinstance(x[1][1], str) for x in conformed_monitors):
+                           isinstance(x[1][0], str) and isinstance(x[1][1], str)
+                           for x in conformed_monitors):
                     raise ValueError("{} should be a list of tuples, found: {}".format(monitor_type, monitors))
             else:
                 # verify a list of tuples
@@ -1593,8 +1859,10 @@ class PipelineController(object):
                 conformed_monitors = [
                     pair if isinstance(pair, (list, tuple)) else (pair, pair) for pair in monitors
                 ]
-                # verify pair of pairs
-                if not all(isinstance(x[0], str) and isinstance(x[1], str) for x in conformed_monitors):
+                # verify the pair of pairs
+                if not all(isinstance(x[0], str) and
+                           isinstance(x[1], str)
+                           for x in conformed_monitors):
                     raise ValueError(
                         "{} should be a list of tuples, found: {}".format(monitor_type, monitors))
 
@@ -1647,7 +1915,7 @@ class PipelineController(object):
             docker=None,  # type: Optional[str]
             docker_args=None,  # type: Optional[str]
             docker_bash_setup_script=None,  # type: Optional[str]
-            parents=None,  # type: Optional[Sequence[str]],
+            parents=None,  # type: Optional[Sequence[str]]
             execution_queue=None,  # type: Optional[str]
             monitor_metrics=None,  # type: Optional[List[Union[Tuple[str, str], Tuple[(str, str), (str, str)]]]]
             monitor_artifacts=None,  # type: Optional[List[Union[str, Tuple[str, str]]]]
@@ -1658,11 +1926,13 @@ class PipelineController(object):
             post_execute_callback=None,  # type: Optional[Callable[[PipelineController, PipelineController.Node], None]]  # noqa
             cache_executed_step=False,  # type: bool
             retry_on_failure=None,  # type: Optional[Union[int, Callable[[PipelineController, PipelineController.Node, int], bool]]]   # noqa
+            status_change_callback=None,  # type: Optional[Callable[[PipelineController, PipelineController.Node, str], None]]  # noqa
+            tags=None  # type: Optional[Union[str, Sequence[str]]]
     ):
         # type: (...) -> bool
         """
         Create a Task from a function, including wrapping the function input arguments
-        into the hyper-parameter section as kwargs, and storing function results as named artifacts
+        into the hyperparameter section as kwargs, and storing function results as named artifacts
 
         Example:
 
@@ -1716,7 +1986,7 @@ class PipelineController(object):
             Example local repo copy: './repo' -> will automatically store the remote
             repo url and commit ID based on the locally cloned copy
         :param repo_branch: Optional, specify the remote repository branch (Ignored, if local repo path is used)
-        :param repo_commit: Optional, specify the repository commit id (Ignored, if local repo path is used)
+        :param repo_commit: Optional, specify the repository commit ID (Ignored, if local repo path is used)
         :param helper_functions: Optional, a list of helper functions to make available
             for the standalone function Task.
         :param docker: Select the docker image to be executed in by the remote session
@@ -1754,7 +2024,7 @@ class PipelineController(object):
         :param continue_on_fail: (default False). If True, failed step will not cause the pipeline to stop
             (or marked as failed). Notice, that steps that are connected (or indirectly connected)
             to the failed step will be skipped.
-        :param pre_execute_callback: Callback function, called when the step (Task) is created
+        :param pre_execute_callback: Callback function, called when the step (Task) is created,
             and before it is sent for execution. Allows a user to modify the Task before launch.
             Use `node.job` to access the ClearmlJob object, or `node.job.task` to directly access the Task object.
             `parameters` are the configuration arguments passed to the ClearmlJob.
@@ -1775,7 +2045,7 @@ class PipelineController(object):
                     pass
 
         :param post_execute_callback: Callback function, called when a step (Task) is completed
-            and it other jobs are executed. Allows a user to modify the Task status after completion.
+            and other jobs are executed. Allows a user to modify the Task status after completion.
 
             .. code-block:: py
 
@@ -1808,6 +2078,23 @@ class PipelineController(object):
                         # allow up to 5 retries (total of 6 runs)
                         return retries < 5
 
+        :param status_change_callback: Callback function, called when the status of a step (Task) changes.
+            Use `node.job` to access the ClearmlJob object, or `node.job.task` to directly access the Task object.
+            The signature of the function must look the following way:
+
+            .. code-block:: py
+
+                def status_change_callback(
+                    pipeline,             # type: PipelineController,
+                    node,                 # type: PipelineController.Node,
+                    previous_status       # type: str
+                ):
+                    pass
+
+        :param tags: A list of tags for the specific pipeline step.
+            When executing a Pipeline remotely
+            (i.e. launching the pipeline from the UI/enqueuing it), this method has no effect.
+
         :return: True if successful
         """
         # always store callback functions (even when running remotely)
@@ -1815,6 +2102,8 @@ class PipelineController(object):
             self._pre_step_callbacks[name] = pre_execute_callback
         if post_execute_callback:
             self._post_step_callbacks[name] = post_execute_callback
+        if status_change_callback:
+            self._status_change_callbacks[name] = status_change_callback
 
         self._verify_node_name(name)
 
@@ -1887,6 +2176,10 @@ class PipelineController(object):
             )
             # replace reference
             a_task.update_task(task_definition)
+
+            if tags:
+                a_task.add_tags(tags)
+
             return a_task
 
         self._nodes[name] = self.Node(
@@ -1902,6 +2195,7 @@ class PipelineController(object):
             monitor_metrics=monitor_metrics,
             monitor_models=monitor_models,
             job_code_section=job_code_section,
+            explicit_docker_image=docker
         )
         self._retries[name] = 0
         self._retries_callbacks[name] = retry_on_failure if callable(retry_on_failure) else \
@@ -1925,7 +2219,8 @@ class PipelineController(object):
         node.job.task.get_logger().report_text(
             "\nNode '{}' failed. Retrying... (this is retry number {})\n".format(node.name, self._retries[node.name])
         )
-        node.job.launch(queue_name=node.queue or self._default_execution_queue)
+        parsed_queue_name = self._parse_step_ref(node.queue)
+        node.job.launch(queue_name=parsed_queue_name or self._default_execution_queue)
 
     def _launch_node(self, node):
         # type: (PipelineController.Node) -> ()
@@ -1949,15 +2244,17 @@ class PipelineController(object):
 
         updated_hyper_parameters = {}
         for k, v in node.parameters.items():
-            updated_hyper_parameters[k] = self._parse_step_ref(v)
+            updated_hyper_parameters[k] = self._parse_step_ref(v, recursive=node.recursively_parse_parameters)
 
         task_overrides = self._parse_task_overrides(node.task_overrides) if node.task_overrides else None
 
         extra_args = dict()
-        extra_args['project'] = self._get_target_project(return_project_id=True) or None
+        extra_args["project"] = self._get_target_project(return_project_id=True) or None
         # set Task name to match job name
         if self._pipeline_as_sub_project:
-            extra_args['name'] = node.name
+            extra_args["name"] = node.name
+        if node.explicit_docker_image:
+            extra_args["explicit_docker_image"] = node.explicit_docker_image
 
         skip_node = None
         if self._pre_step_callbacks.get(node.name):
@@ -2014,7 +2311,9 @@ class PipelineController(object):
             self._running_nodes.append(node.name)
         else:
             self._running_nodes.append(node.name)
-            return node.job.launch(queue_name=node.queue or self._default_execution_queue)
+
+            parsed_queue_name = self._parse_step_ref(node.queue)
+            return node.job.launch(queue_name=parsed_queue_name or self._default_execution_queue)
 
         return True
 
@@ -2028,9 +2327,7 @@ class PipelineController(object):
             return
 
         nodes = list(self._nodes.values())
-        # update status
-        for n in nodes:
-            self._update_node_status(n)
+        self._update_nodes_status()
 
         # update the configuration state, so that the UI is presents the correct state
         self._force_task_configuration_update()
@@ -2061,10 +2358,16 @@ class PipelineController(object):
                 visited.append(node.name)
                 idx = len(visited) - 1
                 parents = [visited.index(p) for p in node.parents or []]
+                if node.job and node.job.task_parameter_override is not None:
+                    node.job.task_parameter_override.update(node.parameters or {})
                 node_params.append(
-                    (node.job.task_parameter_override
-                     if node.job and node.job.task_parameter_override
-                     else node.parameters) or {})
+                    (
+                        node.job.task_parameter_override
+                        if node.job and node.job.task_parameter_override
+                        else node.parameters
+                    )
+                    or {}
+                )
                 # sankey_node['label'].append(node.name)
                 # sankey_node['customdata'].append(
                 #     '<br />'.join('{}: {}'.format(k, v) for k, v in (node.parameters or {}).items()))
@@ -2150,7 +2453,8 @@ class PipelineController(object):
 
         :param node_params: list of node parameters
         :param visited: list of nodes
-        :return: Table as List of List of strings (cell)
+
+        :return: Table as a List of a List of strings (cell)
         """
         task_link_template = self._task.get_output_log_web_page() \
             .replace('/{}/'.format(self._task.project), '/{project}/') \
@@ -2215,22 +2519,34 @@ class PipelineController(object):
         }
         return color_lookup.get(node.status, "")
 
-    @classmethod
-    def _update_node_status(cls, node):
-        # type (self.Mode) -> ()
+    def _update_nodes_status(self):
+        # type () -> ()
+        """
+        Update the status of all nodes in the pipeline
+        """
+        jobs = []
+        previous_status_map = {}
+        # copy to avoid race condition
+        nodes = self._nodes.copy()
+        for name, node in nodes.items():
+            if not node.job:
+                continue
+            # noinspection PyProtectedMember
+            previous_status_map[name] = node.job._last_status
+            jobs.append(node.job)
+        BaseJob.update_status_batch(jobs)
+        for node in nodes.values():
+            self._update_node_status(node)
+
+    def _update_node_status(self, node):
+        # type (self.Node) -> ()
         """
         Update the node status entry based on the node/job state
         :param node: A node in the pipeline
         """
-        if not node:
-            return
+        previous_status = node.status
 
-        # update job ended:
         update_job_ended = node.job_started and not node.job_ended
-
-        # refresh status
-        if node.job and isinstance(node.job, BaseJob):
-            node.job.status(force=True)
 
         if node.executed is not None:
             if node.job and node.job.is_failed():
@@ -2268,7 +2584,18 @@ class PipelineController(object):
         if update_job_ended and node.status in ("aborted", "failed", "completed"):
             node.job_ended = time()
 
-        assert node.status in cls.valid_job_status
+        if (
+            previous_status is not None
+            and previous_status != node.status
+            and self._status_change_callbacks.get(node.name)
+        ):
+            # noinspection PyBroadException
+            try:
+                self._status_change_callbacks[node.name](self, node, previous_status)
+            except Exception as e:
+                getLogger("clearml.automation.controller").warning(
+                    "Failed calling the status change callback for node '{}'. Error is '{}'".format(node.name, e)
+                )
 
     def _update_dag_state_artifact(self):
         # type: () -> ()
@@ -2296,7 +2623,9 @@ class PipelineController(object):
         """
         if time() - self._last_progress_update_time < self._update_progress_interval:
             return
-        job_progress = [(node.job.task.get_progress() or 0) if node.job else 0 for node in self._nodes.values()]
+        # copy to avoid race condition
+        nodes = self._nodes.copy()
+        job_progress = [(node.job.task.get_progress() or 0) if node.job else 0 for node in nodes.values()]
         if len(job_progress):
             self._task.set_progress(int(sum(job_progress) / len(job_progress)))
         self._last_progress_update_time = time()
@@ -2323,6 +2652,7 @@ class PipelineController(object):
                 break
 
             self._update_progress()
+            self._update_nodes_status()
             # check the state of all current jobs
             # if no a job ended, continue
             completed_jobs = []
@@ -2408,6 +2738,8 @@ class PipelineController(object):
                 self._launch_node, [self._nodes[name] for name in next_nodes])
             for name, success in zip(next_nodes, node_launch_success):
                 if success and not self._nodes[name].skip_job:
+                    if self._nodes[name].job and self._nodes[name].job.task_parameter_override is not None:
+                        self._nodes[name].job.task_parameter_override.update(self._nodes[name].parameters or {})
                     print('Launching step: {}'.format(name))
                     print('Parameters:\n{}'.format(
                         self._nodes[name].job.task_parameter_override if self._nodes[name].job
@@ -2451,11 +2783,12 @@ class PipelineController(object):
             except Exception:
                 pass
 
-    def _parse_step_ref(self, value):
+    def _parse_step_ref(self, value, recursive=False):
         # type: (Any) -> Optional[str]
         """
         Return the step reference. For example "${step1.parameters.Args/param}"
         :param value: string
+        :param recursive: if True, recursively parse all values in the dict, list or tuple
         :return:
         """
         # look for all the step references
@@ -2468,6 +2801,18 @@ class PipelineController(object):
                 if not isinstance(new_val, six.string_types):
                     return new_val
                 updated_value = updated_value.replace(g, new_val, 1)
+
+        # if we have a dict, list or tuple, we need to recursively update the values
+        if recursive:
+            if isinstance(value, dict):
+                updated_value = {}
+                for k, v in value.items():
+                    updated_value[k] = self._parse_step_ref(v, recursive=True)
+            elif isinstance(value, list):
+                updated_value = [self._parse_step_ref(v, recursive=True) for v in value]
+            elif isinstance(value, tuple):
+                updated_value = tuple(self._parse_step_ref(v, recursive=True) for v in value)
+
         return updated_value
 
     def _parse_task_overrides(self, task_overrides):
@@ -2598,6 +2943,7 @@ class PipelineController(object):
         return the pipeline components target folder name/id
 
         :param return_project_id: if False (default), return target folder name. If True, return project id
+
         :return: project id/name (None if not valid)
         """
         if not self._target_project:
@@ -2875,7 +3221,11 @@ class PipelineController(object):
             name=artifact_name,
             artifact_object=artifact_object,
             wait_on_upload=True,
-            extension_name=".pkl" if isinstance(artifact_object, dict) else None,
+            extension_name=(
+                ".pkl" if isinstance(artifact_object, dict) and not self._artifact_serialization_function
+                else None
+            ),
+            serialization_function=self._artifact_serialization_function
         )
 
 
@@ -2896,7 +3246,7 @@ class PipelineDecorator(PipelineController):
             self,
             name,  # type: str
             project,  # type: str
-            version,  # type: str
+            version=None,  # type: Optional[str]
             pool_frequency=0.2,  # type: float
             add_pipeline_tags=False,  # type: bool
             target_project=None,  # type: Optional[str]
@@ -2909,7 +3259,9 @@ class PipelineDecorator(PipelineController):
             packages=None,  # type: Optional[Union[str, Sequence[str]]]
             repo=None,  # type: Optional[str]
             repo_branch=None,  # type: Optional[str]
-            repo_commit=None  # type: Optional[str]
+            repo_commit=None,  # type: Optional[str]
+            artifact_serialization_function=None,  # type: Optional[Callable[[Any], Union[bytes, bytearray]]]
+            artifact_deserialization_function=None  # type: Optional[Callable[[bytes], Any]]
     ):
         # type: (...) -> ()
         """
@@ -2917,29 +3269,32 @@ class PipelineDecorator(PipelineController):
 
         :param name: Provide pipeline name (if main Task exists it overrides its name)
         :param project: Provide project storing the pipeline (if main Task exists  it overrides its project)
-        :param version: Must provide pipeline version. This version allows to uniquely identify the pipeline
-            template execution. Examples for semantic versions: version='1.0.1' , version='23', version='1.2'
+        :param version: Pipeline version. This version allows to uniquely identify the pipeline
+            template execution. Examples for semantic versions: version='1.0.1' , version='23', version='1.2'.
+            If not set, find the latest version of the pipeline and increment it. If no such version is found,
+            default to '1.0.0'
         :param float pool_frequency: The pooling frequency (in minutes) for monitoring experiments / states.
         :param bool add_pipeline_tags: (default: False) if True, add `pipe: <pipeline_task_id>` tag to all
             steps (Tasks) created by this pipeline.
         :param str target_project: If provided, all pipeline steps are cloned into the target project
         :param bool abort_on_failure: If False (default), failed pipeline steps will not cause the pipeline
             to stop immediately, instead any step that is not connected (or indirectly connected) to the failed step,
-            will still be executed. Nonetheless the pipeline itself will be marked failed, unless the failed step
+            will still be executed. Nonetheless, the pipeline itself will be marked failed, unless the failed step
             was specifically defined with "continue_on_fail=True".
             If True, any failed step will cause the pipeline to immediately abort, stop all running steps,
             and mark the pipeline as failed.
         :param add_run_number: If True (default), add the run number of the pipeline to the pipeline name.
             Example, the second time we launch the pipeline "best pipeline", we rename it to "best pipeline #2"
         :param retry_on_failure: Integer (number of retries) or Callback function that returns True to allow a retry
-            - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
-            - Callable: A function called on node failure. Takes as parameters:
-                the PipelineController instance, the PipelineController.Node that failed and an int
-                representing the number of previous retries for the node that failed
-                The function must return a `bool`: True if the node should be retried and False otherwise.
-                If True, the node will be re-queued and the number of retries left will be decremented by 1.
-                By default, if this callback is not specified, the function will be retried the number of
-                times indicated by `retry_on_failure`.
+
+          - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
+          - Callable: A function called on node failure. Takes as parameters:
+              the PipelineController instance, the PipelineController.Node that failed and an int
+              representing the number of previous retries for the node that failed.
+              The function must return ``True`` if the node should be retried and ``False`` otherwise.
+              If True, the node will be re-queued and the number of retries left will be decremented by 1.
+              By default, if this callback is not specified, the function will be retried the number of
+              times indicated by `retry_on_failure`.
 
                 .. code-block:: py
 
@@ -2962,8 +3317,30 @@ class PipelineDecorator(PipelineController):
             Example remote url: 'https://github.com/user/repo.git'
             Example local repo copy: './repo' -> will automatically store the remote
             repo url and commit ID based on the locally cloned copy
+            Use empty string ("") to disable any repository auto-detection
         :param repo_branch: Optional, specify the remote repository branch (Ignored, if local repo path is used)
-        :param repo_commit: Optional, specify the repository commit id (Ignored, if local repo path is used)
+        :param repo_commit: Optional, specify the repository commit ID (Ignored, if local repo path is used)
+        :param artifact_serialization_function: A serialization function that takes one
+            parameter of any type which is the object to be serialized. The function should return
+            a `bytes` or `bytearray` object, which represents the serialized object. All parameter/return
+            artifacts uploaded by the pipeline will be serialized using this function.
+            All relevant imports must be done in this function. For example:
+
+            .. code-block:: py
+
+                def serialize(obj):
+                    import dill
+                    return dill.dumps(obj)
+        :param artifact_deserialization_function: A deserialization function that takes one parameter of type `bytes`,
+            which represents the serialized object. This function should return the deserialized object.
+            All parameter/return artifacts fetched by the pipeline will be deserialized using this function.
+            All relevant imports must be done in this function. For example:
+
+            .. code-block:: py
+
+                def deserialize(bytes_):
+                    import dill
+                    return dill.loads(bytes_)
         """
         super(PipelineDecorator, self).__init__(
             name=name,
@@ -2981,7 +3358,10 @@ class PipelineDecorator(PipelineController):
             packages=packages,
             repo=repo,
             repo_branch=repo_branch,
-            repo_commit=repo_commit
+            repo_commit=repo_commit,
+            always_create_from_code=False,
+            artifact_serialization_function=artifact_serialization_function,
+            artifact_deserialization_function=artifact_deserialization_function
         )
 
         # if we are in eager execution, make sure parent class knows it
@@ -3025,6 +3405,7 @@ class PipelineDecorator(PipelineController):
                 break
 
             self._update_progress()
+            self._update_nodes_status()
             # check the state of all current jobs
             # if no a job ended, continue
             completed_jobs = []
@@ -3122,6 +3503,7 @@ class PipelineDecorator(PipelineController):
 
         # visualize pipeline state (plot)
         self.update_execution_plot()
+        self._scan_monitored_nodes()
 
         if self._stop_event:
             # noinspection PyBroadException
@@ -3243,7 +3625,9 @@ class PipelineDecorator(PipelineController):
             helper_functions=helper_functions,
             dry_run=True,
             task_template_header=self._task_template_header,
-            _sanitize_function=sanitize
+            _sanitize_function=sanitize,
+            artifact_serialization_function=self._artifact_serialization_function,
+            artifact_deserialization_function=self._artifact_deserialization_function
         )
         return task_definition
 
@@ -3315,7 +3699,11 @@ class PipelineDecorator(PipelineController):
             monitor_metrics=None,  # type: Optional[List[Union[Tuple[str, str], Tuple[(str, str), (str, str)]]]]
             monitor_artifacts=None,  # type: Optional[List[Union[str, Tuple[str, str]]]]
             monitor_models=None,  # type: Optional[List[Union[str, Tuple[str, str]]]]
-            retry_on_failure=None  # type: Optional[Union[int, Callable[[PipelineController, PipelineController.Node, int], bool]]]   # noqa
+            retry_on_failure=None,  # type: Optional[Union[int, Callable[[PipelineController, PipelineController.Node, int], bool]]]   # noqa
+            pre_execute_callback=None,  # type: Optional[Callable[[PipelineController, PipelineController.Node, dict], bool]]  # noqa
+            post_execute_callback=None,  # type: Optional[Callable[[PipelineController, PipelineController.Node], None]]  # noqa
+            status_change_callback=None,  # type: Optional[Callable[[PipelineController, PipelineController.Node, str], None]]  # noqa
+            tags=None  # type: Optional[Union[str, Sequence[str]]]
     ):
         # type: (...) -> Callable
         """
@@ -3323,7 +3711,7 @@ class PipelineDecorator(PipelineController):
 
         :param _func: wrapper function
         :param return_values: Provide a list of names for all the results.
-            Notice! If not provided no results will be stored as artifacts.
+            Notice! If not provided, no results will be stored as artifacts.
         :param name: Optional, set the name of the pipeline component task.
             If not provided, the wrapped function name is used as the pipeline component name
         :param cache: If True, before launching the new step,
@@ -3358,7 +3746,7 @@ class PipelineDecorator(PipelineController):
             Example local repo copy: './repo' -> will automatically store the remote
             repo url and commit ID based on the locally cloned copy
         :param repo_branch: Optional, specify the remote repository branch (Ignored, if local repo path is used)
-        :param repo_commit: Optional, specify the repository commit id (Ignored, if local repo path is used)
+        :param repo_commit: Optional, specify the repository commit ID (Ignored, if local repo path is used)
         :param helper_functions: Optional, a list of helper functions to make available
             for the standalone pipeline step function Task. By default the pipeline step function has
             no access to any of the other functions, by specifying additional functions here, the remote pipeline step
@@ -3406,6 +3794,54 @@ class PipelineDecorator(PipelineController):
                         # allow up to 5 retries (total of 6 runs)
                         return retries < 5
 
+        :param pre_execute_callback: Callback function, called when the step (Task) is created,
+             and before it is sent for execution. Allows a user to modify the Task before launch.
+            Use `node.job` to access the ClearmlJob object, or `node.job.task` to directly access the Task object.
+            `parameters` are the configuration arguments passed to the ClearmlJob.
+
+            If the callback returned value is `False`,
+            the Node is skipped and so is any node in the DAG that relies on this node.
+
+            Notice the `parameters` are already parsed,
+            e.g. `${step1.parameters.Args/param}` is replaced with relevant value.
+
+            .. code-block:: py
+
+                def step_created_callback(
+                    pipeline,             # type: PipelineController,
+                    node,                 # type: PipelineController.Node,
+                    parameters,           # type: dict
+                ):
+                    pass
+
+        :param post_execute_callback: Callback function, called when a step (Task) is completed
+            and other jobs are going to be executed. Allows a user to modify the Task status after completion.
+
+            .. code-block:: py
+
+                def step_completed_callback(
+                    pipeline,             # type: PipelineController,
+                    node,                 # type: PipelineController.Node,
+                ):
+                    pass
+
+        :param status_change_callback: Callback function, called when the status of a step (Task) changes.
+            Use `node.job` to access the ClearmlJob object, or `node.job.task` to directly access the Task object.
+            The signature of the function must look the following way:
+
+            .. code-block:: py
+
+                def status_change_callback(
+                    pipeline,             # type: PipelineController,
+                    node,                 # type: PipelineController.Node,
+                    previous_status       # type: str
+                ):
+                    pass
+
+        :param tags: A list of tags for the specific pipeline step.
+            When executing a Pipeline remotely
+            (i.e. launching the pipeline from the UI/enqueuing it), this method has no effect.
+
         :return: function wrapper
         """
         def decorator_wrap(func):
@@ -3444,6 +3880,10 @@ class PipelineDecorator(PipelineController):
                 monitor_metrics=monitor_metrics,
                 monitor_models=monitor_models,
                 monitor_artifacts=monitor_artifacts,
+                pre_execute_callback=pre_execute_callback,
+                post_execute_callback=post_execute_callback,
+                status_change_callback=status_change_callback,
+                tags=tags
             )
 
             if cls._singleton:
@@ -3526,7 +3966,7 @@ class PipelineDecorator(PipelineController):
                     if target_queue:
                         PipelineDecorator.set_default_execution_queue(target_queue)
                     else:
-                        # if we are are not running from a queue, we are probably in debug mode
+                        # if we are not running from a queue, we are probably in debug mode
                         a_pipeline._clearml_job_class = LocalClearmlJob
                         a_pipeline._default_execution_queue = 'mock'
 
@@ -3552,8 +3992,9 @@ class PipelineDecorator(PipelineController):
                     # Note that for the first iteration (when `_node.name == _node_name`)
                     # we always increment the name, as the name is always in `_launched_step_names`
                     while _node.name in cls._singleton._launched_step_names or (
-                        _node.name in cls._singleton._nodes
-                        and cls._singleton._nodes[_node.name].job_code_section != cls._singleton._nodes[_node_name].job_code_section
+                        _node.name in cls._singleton._nodes and
+                        cls._singleton._nodes[_node.name].job_code_section !=
+                        cls._singleton._nodes[_node_name].job_code_section
                     ):
                         _node.name = "{}_{}".format(_node_name, counter)
                         counter += 1
@@ -3621,7 +4062,9 @@ class PipelineDecorator(PipelineController):
 
                     task = Task.get_task(_node.job.task_id())
                     if return_name in task.artifacts:
-                        return task.artifacts[return_name].get()
+                        return task.artifacts[return_name].get(
+                            deserialization_function=cls._singleton._artifact_deserialization_function
+                        )
                     return task.get_parameters(cast=True)[CreateFromFunction.return_section + "/" + return_name]
 
                 return_w = [LazyEvalWrapper(
@@ -3645,7 +4088,7 @@ class PipelineDecorator(PipelineController):
             _func=None, *,  # noqa
             name,  # type: str
             project,  # type: str
-            version,  # type: str
+            version=None,  # type: Optional[str]
             return_value=None,  # type: Optional[str]
             default_queue=None,  # type: Optional[str]
             pool_frequency=0.2,  # type: float
@@ -3664,7 +4107,9 @@ class PipelineDecorator(PipelineController):
             packages=None,  # type: Optional[Union[str, Sequence[str]]]
             repo=None,  # type: Optional[str]
             repo_branch=None,  # type: Optional[str]
-            repo_commit=None  # type: Optional[str]
+            repo_commit=None,  # type: Optional[str]
+            artifact_serialization_function=None,  # type: Optional[Callable[[Any], Union[bytes, bytearray]]]
+            artifact_deserialization_function=None  # type: Optional[Callable[[bytes], Any]]
     ):
         # type: (...) -> Callable
         """
@@ -3672,8 +4117,10 @@ class PipelineDecorator(PipelineController):
 
         :param name: Provide pipeline name (if main Task exists it overrides its name)
         :param project: Provide project storing the pipeline (if main Task exists  it overrides its project)
-        :param version: Must provide pipeline version. This version allows to uniquely identify the pipeline
-            template execution. Examples for semantic versions: version='1.0.1' , version='23', version='1.2'
+        :param version: Pipeline version. This version allows to uniquely identify the pipeline
+            template execution. Examples for semantic versions: version='1.0.1' , version='23', version='1.2'.
+            If not set, find the latest version of the pipeline and increment it. If no such version is found,
+            default to '1.0.0'
         :param return_value: Optional, Provide an artifact name to store the pipeline function return object
             Notice, If not provided the pipeline will not store the pipeline function return value.
         :param default_queue: default pipeline step queue
@@ -3683,7 +4130,7 @@ class PipelineDecorator(PipelineController):
         :param str target_project: If provided, all pipeline steps are cloned into the target project
         :param bool abort_on_failure: If False (default), failed pipeline steps will not cause the pipeline
             to stop immediately, instead any step that is not connected (or indirectly connected) to the failed step,
-            will still be executed. Nonetheless the pipeline itself will be marked failed, unless the failed step
+            will still be executed. Nonetheless, the pipeline itself will be marked failed, unless the failed step
             was specifically defined with "continue_on_fail=True".
             If True, any failed step will cause the pipeline to immediately abort, stop all running steps,
             and mark the pipeline as failed.
@@ -3708,22 +4155,25 @@ class PipelineDecorator(PipelineController):
                     pass
 
             Parameters would be stored as:
-              - paramA: sectionA/paramA
-              - paramB: sectionB/paramB
-              - paramC: sectionB/paramC
-              - paramD: Args/paramD
+
+          - paramA: sectionA/paramA
+          - paramB: sectionB/paramB
+          - paramC: sectionB/paramC
+          - paramD: Args/paramD
+
         :param start_controller_locally: If True, start the controller on the local machine. The steps will run
             remotely if `PipelineDecorator.run_locally` or `PipelineDecorator.debug_pipeline` are not called.
             Default: False
         :param retry_on_failure: Integer (number of retries) or Callback function that returns True to allow a retry
-            - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
-            - Callable: A function called on node failure. Takes as parameters:
-                the PipelineController instance, the PipelineController.Node that failed and an int
-                representing the number of previous retries for the node that failed
-                The function must return a `bool`: True if the node should be retried and False otherwise.
-                If True, the node will be re-queued and the number of retries left will be decremented by 1.
-                By default, if this callback is not specified, the function will be retried the number of
-                times indicated by `retry_on_failure`.
+
+          - Integer: In case of node failure, retry the node the number of times indicated by this parameter.
+          - Callable: A function called on node failure. Takes as parameters:
+              the PipelineController instance, the PipelineController.Node that failed and an int
+              representing the number of previous retries for the node that failed.
+              The function must return ``True`` if the node should be retried and ``False`` otherwise.
+              If True, the node will be re-queued and the number of retries left will be decremented by 1.
+              By default, if this callback is not specified, the function will be retried the number of
+              times indicated by `retry_on_failure`.
 
                 .. code-block:: py
 
@@ -3746,8 +4196,30 @@ class PipelineDecorator(PipelineController):
             Example remote url: 'https://github.com/user/repo.git'
             Example local repo copy: './repo' -> will automatically store the remote
             repo url and commit ID based on the locally cloned copy
+            Use empty string ("") to disable any repository auto-detection
         :param repo_branch: Optional, specify the remote repository branch (Ignored, if local repo path is used)
-        :param repo_commit: Optional, specify the repository commit id (Ignored, if local repo path is used)
+        :param repo_commit: Optional, specify the repository commit ID (Ignored, if local repo path is used)
+        :param artifact_serialization_function: A serialization function that takes one
+            parameter of any type which is the object to be serialized. The function should return
+            a `bytes` or `bytearray` object, which represents the serialized object. All parameter/return
+            artifacts uploaded by the pipeline will be serialized using this function.
+            All relevant imports must be done in this function. For example:
+
+            .. code-block:: py
+
+                def serialize(obj):
+                    import dill
+                    return dill.dumps(obj)
+        :param artifact_deserialization_function: A deserialization function that takes one parameter of type `bytes`,
+            which represents the serialized object. This function should return the deserialized object.
+            All parameter/return artifacts fetched by the pipeline will be deserialized using this function.
+            All relevant imports must be done in this function. For example:
+
+            .. code-block:: py
+
+                def deserialize(bytes_):
+                    import dill
+                    return dill.loads(bytes_)
         """
         def decorator_wrap(func):
 
@@ -3791,7 +4263,9 @@ class PipelineDecorator(PipelineController):
                         packages=packages,
                         repo=repo,
                         repo_branch=repo_branch,
-                        repo_commit=repo_commit
+                        repo_commit=repo_commit,
+                        artifact_serialization_function=artifact_serialization_function,
+                        artifact_deserialization_function=artifact_deserialization_function
                     )
                     ret_val = func(**pipeline_kwargs)
                     LazyEvalWrapper.trigger_all_remote_references()
@@ -3840,7 +4314,9 @@ class PipelineDecorator(PipelineController):
                     packages=packages,
                     repo=repo,
                     repo_branch=repo_branch,
-                    repo_commit=repo_commit
+                    repo_commit=repo_commit,
+                    artifact_serialization_function=artifact_serialization_function,
+                    artifact_deserialization_function=artifact_deserialization_function
                 )
 
                 a_pipeline._args_map = args_map or {}
@@ -3865,19 +4341,20 @@ class PipelineDecorator(PipelineController):
                     a_pipeline._task._set_runtime_properties(
                         dict(multi_pipeline_counter=str(cls._multi_pipeline_call_counter)))
 
-                a_pipeline._start(wait=False)
-
-                # sync arguments back (post deserialization and casting back)
-                for k in pipeline_kwargs.keys():
-                    if k in a_pipeline.get_parameters():
-                        pipeline_kwargs[k] = a_pipeline.get_parameters()[k]
-
                 # run the actual pipeline
                 if not start_controller_locally and \
                         not PipelineDecorator._debug_execute_step_process and pipeline_execution_queue:
                     # rerun the pipeline on a remote machine
                     a_pipeline._task.execute_remotely(queue_name=pipeline_execution_queue)
                     # when we get here it means we are running remotely
+
+                # this will also deserialize the pipeline and arguments
+                a_pipeline._start(wait=False)
+
+                # sync arguments back (post deserialization and casting back)
+                for k in pipeline_kwargs.keys():
+                    if k in a_pipeline.get_parameters():
+                        pipeline_kwargs[k] = a_pipeline.get_parameters()[k]
 
                 # this time the pipeline is executed only on the remote machine
                 try:

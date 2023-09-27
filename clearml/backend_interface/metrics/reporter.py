@@ -1,3 +1,4 @@
+import atexit
 import datetime
 import json
 import logging
@@ -33,9 +34,8 @@ except ImportError:
 class BackgroundReportService(BackgroundMonitor, AsyncManagerMixin):
     __daemon_live_check_timeout = 10.0
 
-    def __init__(self, task, async_enable, metrics, flush_frequency, flush_threshold):
-        super(BackgroundReportService, self).__init__(
-            task=task, wait_period=flush_frequency)
+    def __init__(self, task, async_enable, metrics, flush_frequency, flush_threshold, for_model=False):
+        super(BackgroundReportService, self).__init__(task=task, wait_period=flush_frequency, for_model=for_model)
         self._flush_threshold = flush_threshold
         self._flush_event = ForkEvent()
         self._empty_state_event = ForkEvent()
@@ -250,7 +250,7 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         reporter.flush()
     """
 
-    def __init__(self, metrics, task, async_enable=False):
+    def __init__(self, metrics, task, async_enable=False, for_model=False):
         """
         Create a reporter
         :param metrics: A Metrics manager instance that handles actual reporting, uploads etc.
@@ -269,10 +269,17 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         self._async_enable = async_enable
         self._flush_frequency = 5.0
         self._max_iteration = 0
+        self._for_model = for_model
         flush_threshold = config.get("development.worker.report_event_flush_threshold", 100)
         self._report_service = BackgroundReportService(
-            task=task, async_enable=async_enable, metrics=metrics,
-            flush_frequency=self._flush_frequency, flush_threshold=flush_threshold)
+            task=task,
+            async_enable=async_enable,
+            metrics=metrics,
+            flush_frequency=self._flush_frequency,
+            flush_threshold=flush_threshold,
+            for_model=for_model,
+        )
+        atexit.register(self._handle_program_exit)
         self._report_service.start()
 
     def _set_storage_uri(self, value):
@@ -304,21 +311,36 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
             self._max_iteration = max(self._max_iteration, ev_iteration + self._metrics.get_iteration_offset())
         self._report_service.add_event(ev)
 
+    def _handle_program_exit(self):
+        try:
+            self.flush()
+            self.wait_for_events()
+            self.stop()
+        except Exception as e:
+            logging.getLogger("clearml.reporter").warning(
+                "Exception encountered cleaning up the reporter: {}".format(e)
+            )
+
     def flush(self):
         """
         Flush cached reports to backend.
         """
-        if self._report_service:
-            self._report_service.flush()
+        # we copy this value for thread safety
+        report_service = self._report_service
+        if report_service:
+            report_service.flush()
 
     def wait_for_events(self, timeout=None):
-        if self._report_service:
-            return self._report_service.wait_for_events(timeout=timeout)
+        # we copy this value for thread safety
+        report_service = self._report_service
+        if report_service:
+            return report_service.wait_for_events(timeout=timeout)
 
     def stop(self):
-        if not self._report_service:
-            return
+        # save the report service and allow multiple threads to access it
         report_service = self._report_service
+        if not report_service:
+            return
         self._report_service = None
         if not report_service.is_subprocess_mode() or report_service.is_alive():
             report_service.stop()
@@ -354,8 +376,12 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         :param iter: Iteration number
         :type iter: int
         """
-        ev = ScalarEvent(metric=self._normalize_name(title), variant=self._normalize_name(series), value=value,
-                         iter=iter)
+        ev = ScalarEvent(
+            metric=self._normalize_name(title),
+            variant=self._normalize_name(series),
+            value=value,
+            iter=iter
+        )
         self._report(ev)
 
     def report_vector(self, title, series, values, iter):
@@ -456,8 +482,12 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         elif not isinstance(plot, six.string_types):
             raise ValueError('Plot should be a string or a dict')
 
-        ev = PlotEvent(metric=self._normalize_name(title), variant=self._normalize_name(series),
-                       plot_str=plot, iter=iter)
+        ev = PlotEvent(
+            metric=self._normalize_name(title),
+            variant=self._normalize_name(series),
+            plot_str=plot,
+            iter=iter
+        )
         self._report(ev)
 
     def report_image(self, title, series, src, iter):
@@ -615,7 +645,7 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
             nan_as_null=False,
         )
 
-    def report_table(self, title, series, table, iteration, layout_config=None):
+    def report_table(self, title, series, table, iteration, layout_config=None, data_config=None):
         """
         Report a table plot.
 
@@ -629,8 +659,10 @@ class Reporter(InterfaceBase, AbstractContextManager, SetupUploadMixin, AsyncMan
         :type iteration: int
         :param layout_config: optional dictionary for layout configuration, passed directly to plotly
         :type layout_config: dict or None
+        :param data_config: optional dictionary for data configuration, like column width, passed directly to plotly
+        :type data_config: dict or None
         """
-        table_output = create_plotly_table(table, title, series, layout_config=layout_config)
+        table_output = create_plotly_table(table, title, series, layout_config=layout_config, data_config=data_config)
         return self.report_plot(
             title=self._normalize_name(title),
             series=self._normalize_name(series),

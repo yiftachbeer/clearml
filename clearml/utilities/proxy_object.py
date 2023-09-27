@@ -39,9 +39,15 @@ class ProxyDictPostWrite(dict):
         return a_dict
 
     def update(self, E=None, **F):
-        return super(ProxyDictPostWrite, self).update(
+        res = self._do_update(E, **F)
+        self._set_callback()
+        return res
+
+    def _do_update(self, E=None, **F):
+        res = super(ProxyDictPostWrite, self).update(
             ProxyDictPostWrite(self._update_obj, self._set_callback, E) if E is not None else
             ProxyDictPostWrite(self._update_obj, self._set_callback, **F))
+        return res
 
 
 class ProxyDictPreWrite(dict):
@@ -281,7 +287,7 @@ class WrapperBase(type):
     # (http://code.activestate.com/recipes/496741/). It adds special methods
     # to the wrapper class so it can proxy the wrapped class. In addition, it
     # adds a field __overrides__ in the wrapper class dictionary, containing
-    # all attributes decorated to be overriden.
+    # all attributes decorated to be overridden.
 
     _special_names = [
         '__abs__', '__add__', '__and__', '__call__', '__cmp__', '__coerce__',
@@ -298,6 +304,7 @@ class WrapperBase(type):
         '__rmul__', '__ror__', '__rpow__', '__rrshift__', '__rshift__', '__rsub__',
         '__rtruediv__', '__rxor__', '__setitem__', '__setslice__', '__sub__',
         '__truediv__', '__xor__', 'next', '__str__', '__repr__',
+        '__round__', '__fspath__', '__bytes__', '__index__'
     ]
 
     def __new__(mcs, classname, bases, attrs):

@@ -388,6 +388,7 @@ class EventTrainsWriter(object):
                 imdata = base64.b64decode(img_str)
             output = BytesIO(imdata)
             im = Image.open(output)
+            image = np.asarray(im)
             # if this is a GIF store as is
             if getattr(im, 'is_animated', None):
                 output.close()
@@ -400,9 +401,9 @@ class EventTrainsWriter(object):
                 return temp_file
             output.close()
             if height is not None and height > 0 and width is not None and width > 0:
-                val = np.array(im).reshape((height, width, -1)).astype(np.uint8)
+                val = image.reshape((height, width, -1)).astype(np.uint8)
             else:
-                val = np.array(im).astype(np.uint8)
+                val = image.astype(np.uint8)
             if val.ndim == 3 and val.shape[2] == 3:
                 if self._visualization_mode == 'BGR':
                     val = val[:, :, [2, 1, 0]]
@@ -723,15 +724,8 @@ class EventTrainsWriter(object):
                         'Received event without step, assuming step = {}'.format(step))
             else:
                 step = int(step)
-            # unlike other frameworks, tensorflow already accounts for the iteration number
-            # when continuing the training. we substract the smallest iteration such that we
-            # don't increment the step twice number
-            if EventTrainsWriter._current_task:
-                step -= EventTrainsWriter._current_task.get_initial_iteration()
-            # there can be a few metrics getting reported again, so the step can be negative
-            # for the first few reports
-            if step <= 0:
-                return
+            step = tweak_step(step)
+
             self._max_step = max(self._max_step, step)
             if value_dicts is None:
                 LoggerRoot.get_base_logger(TensorflowBinding).debug("Summary arrived without 'value'")
@@ -1375,7 +1369,7 @@ class PatchTensorFlowEager(object):
                 plugin_type = plugin_type[next(i for i, c in enumerate(plugin_type) if c >= 'A'):]
                 if plugin_type.startswith('scalars'):
                     event_writer._add_scalar(tag=str(tag),
-                                             step=int(step.numpy()) if not isinstance(step, int) else step,
+                                             step=tweak_step(step),
                                              scalar_data=tensor.numpy())
                 elif plugin_type.startswith('images'):
                     img_data_np = tensor.numpy()
@@ -1383,19 +1377,19 @@ class PatchTensorFlowEager(object):
                                                                  tag=tag, step=step, **kwargs)
                 elif plugin_type.startswith('histograms'):
                     event_writer._add_histogram(
-                        tag=str(tag), step=int(step.numpy()) if not isinstance(step, int) else step,
+                        tag=str(tag), step=tweak_step(step),
                         hist_data=tensor.numpy()
                     )
                 elif plugin_type.startswith('text'):
                     event_writer._add_text(
-                        tag=str(tag), step=int(step.numpy()) if not isinstance(step, int) else step,
+                        tag=str(tag), step=tweak_step(step),
                         tensor_bytes=tensor.numpy()
                     )
                 elif 'audio' in plugin_type:
                     audio_bytes_list = [a for a in tensor.numpy().flatten() if a]
                     for i, audio_bytes in enumerate(audio_bytes_list):
                         event_writer._add_audio(tag=str(tag) + ('/{}'.format(i) if len(audio_bytes_list) > 1 else ''),
-                                                step=int(step.numpy()) if not isinstance(step, int) else step,
+                                                step=tweak_step(step),
                                                 values=None, audio_data=audio_bytes)
                 else:
                     pass
@@ -1413,7 +1407,7 @@ class PatchTensorFlowEager(object):
         if event_writer and isinstance(step, int) or hasattr(step, 'numpy'):
             try:
                 event_writer._add_scalar(tag=str(tag),
-                                         step=int(step.numpy()) if not isinstance(step, int) else step,
+                                         step=tweak_step(step),
                                          scalar_data=value.numpy())
             except Exception as ex:
                 LoggerRoot.get_base_logger(TensorflowBinding).warning(str(ex))
@@ -1425,7 +1419,7 @@ class PatchTensorFlowEager(object):
                         str_tag = str_tag.decode() if isinstance(str_tag, bytes) else str(str_tag)
                         event_writer._add_scalar(
                             tag=str_tag,
-                            step=int(a_step.numpy()) if not isinstance(a_step, int) else a_step,
+                            step=tweak_step(step),
                             scalar_data=a_value.numpy())
                     except Exception as a_ex:
                         LoggerRoot.get_base_logger(TensorflowBinding).warning(
@@ -1455,7 +1449,7 @@ class PatchTensorFlowEager(object):
         if event_writer and isinstance(step, int) or hasattr(step, 'numpy'):
             try:
                 event_writer._add_histogram(
-                    tag=str(tag), step=int(step.numpy()) if not isinstance(step, int) else step,
+                    tag=str(tag), step=tweak_step(step),
                     hist_data=values.numpy()
                 )
             except Exception as ex:
@@ -1468,7 +1462,7 @@ class PatchTensorFlowEager(object):
                         str_tag = str_tag.decode() if isinstance(str_tag, bytes) else str(str_tag)
                         event_writer._add_histogram(
                             tag=str_tag,
-                            step=int(a_step.numpy()) if not isinstance(a_step, int) else a_step,
+                            step=tweak_step(a_step),
                             hist_data=a_value.numpy()
                         )
                     except Exception as a_ex:
@@ -1546,11 +1540,11 @@ class PatchTensorFlowEager(object):
                             'colorspace': 'RGB', 'encodedImageString': img_data_np[i]}
                 image_tag = str(tag) + '/sample_{}'.format(i - 2) if img_data_np.size > 3 else str(tag)
                 event_writer._add_image(tag=image_tag,
-                                        step=int(step.numpy()) if not isinstance(step, int) else step,
+                                        step=tweak_step(step),
                                         img_data=img_data)
         else:
             event_writer._add_image_numpy(tag=str(tag),
-                                          step=int(step.numpy()) if not isinstance(step, int) else step,
+                                          step=tweak_step(step),
                                           img_data_np=img_data_np,
                                           max_keep_images=kwargs.get('max_images'))
 
@@ -1595,6 +1589,11 @@ class PatchKerasModelIO(object):
                 from keras import models as keras_saving  # noqa
             except ImportError:
                 keras_saving = None
+            try:
+                from keras.src.saving import saving_api as keras_saving_v3
+            except ImportError:
+                keras_saving_v3 = None
+
             # check that we are not patching anything twice
             if PatchKerasModelIO.__patched_tensorflow:
                 PatchKerasModelIO.__patched_keras = [
@@ -1604,9 +1603,10 @@ class PatchKerasModelIO(object):
                     Functional if PatchKerasModelIO.__patched_tensorflow[3] != Functional else None,
                     None,
                     None,
+                    keras_saving_v3
                 ]
             else:
-                PatchKerasModelIO.__patched_keras = [Network, Sequential, keras_saving, Functional, None, None]
+                PatchKerasModelIO.__patched_keras = [Network, Sequential, keras_saving, Functional, None, None, keras_saving_v3]
             PatchKerasModelIO._patch_io_calls(*PatchKerasModelIO.__patched_keras)
 
         if 'tensorflow' in sys.modules and not PatchKerasModelIO.__patched_tensorflow:
@@ -1649,6 +1649,8 @@ class PatchKerasModelIO(object):
             except ImportError:
                 keras_hdf5 = None
 
+            keras_saving_v3 = None
+
             if PatchKerasModelIO.__patched_keras:
                 PatchKerasModelIO.__patched_tensorflow = [
                     Network if PatchKerasModelIO.__patched_keras[0] != Network else None,
@@ -1657,14 +1659,23 @@ class PatchKerasModelIO(object):
                     Functional if PatchKerasModelIO.__patched_keras[3] != Functional else None,
                     keras_saving_legacy if PatchKerasModelIO.__patched_keras[4] != keras_saving_legacy else None,
                     keras_hdf5 if PatchKerasModelIO.__patched_keras[5] != keras_hdf5 else None,
+                    keras_saving_v3 if PatchKerasModelIO.__patched_keras[6] != keras_saving_v3 else None,
                 ]
             else:
                 PatchKerasModelIO.__patched_tensorflow = [
-                    Network, Sequential, keras_saving, Functional, keras_saving_legacy, keras_hdf5]
+                    Network, Sequential, keras_saving, Functional, keras_saving_legacy, keras_hdf5, keras_saving_v3]
             PatchKerasModelIO._patch_io_calls(*PatchKerasModelIO.__patched_tensorflow)
 
     @staticmethod
-    def _patch_io_calls(Network, Sequential, keras_saving, Functional, keras_saving_legacy=None, keras_hdf5=None):
+    def _patch_io_calls(
+            Network,
+            Sequential,
+            keras_saving,
+            Functional,
+            keras_saving_legacy=None,
+            keras_hdf5=None,
+            keras_saving_v3=None
+    ):
         try:
             if Sequential is not None:
                 Sequential._updated_config = _patched_call(Sequential._updated_config,
@@ -1723,6 +1734,9 @@ class PatchKerasModelIO(object):
                 if hasattr(keras_hdf5, 'save_model_to_hdf5'):
                     keras_hdf5.save_model_to_hdf5 = _patched_call(
                         keras_hdf5.save_model_to_hdf5, PatchKerasModelIO._save_model)
+
+            if keras_saving_v3 is not None:
+                keras_saving_v3.save_model = _patched_call(keras_saving_v3.save_model, PatchKerasModelIO._save_model)
 
         except Exception as ex:
             LoggerRoot.get_base_logger(TensorflowBinding).warning(str(ex))
@@ -2064,6 +2078,11 @@ class PatchTensorflowModelIO(object):
                 Checkpoint.write = _patched_call(Checkpoint.write, PatchTensorflowModelIO._ckpt_write)
             except Exception:
                 pass
+            # noinspection PyBroadException
+            try:
+                Checkpoint._write = _patched_call(Checkpoint._write, PatchTensorflowModelIO._ckpt_write)
+            except Exception:
+                pass
         except ImportError:
             pass
         except Exception:
@@ -2233,27 +2252,56 @@ class PatchTensorflow2ModelIO(object):
             return
 
         PatchTensorflow2ModelIO.__patched = True
+
         # noinspection PyBroadException
         try:
             # hack: make sure tensorflow.__init__ is called
             import tensorflow  # noqa
             from tensorflow.python.training.tracking import util  # noqa
+
             # noinspection PyBroadException
             try:
-                util.TrackableSaver.save = _patched_call(util.TrackableSaver.save,
-                                                         PatchTensorflow2ModelIO._save)
+                util.TrackableSaver.save = _patched_call(util.TrackableSaver.save, PatchTensorflow2ModelIO._save)
             except Exception:
                 pass
+
             # noinspection PyBroadException
             try:
-                util.TrackableSaver.restore = _patched_call(util.TrackableSaver.restore,
-                                                            PatchTensorflow2ModelIO._restore)
+                util.TrackableSaver.restore = _patched_call(
+                    util.TrackableSaver.restore, PatchTensorflow2ModelIO._restore
+                )
             except Exception:
                 pass
         except ImportError:
             pass
         except Exception:
             LoggerRoot.get_base_logger(TensorflowBinding).debug('Failed patching tensorflow v2')
+
+        # noinspection PyBroadException
+        try:
+            # hack: make sure tensorflow.__init__ is called
+            import tensorflow  # noqa
+            from tensorflow.python.checkpoint import checkpoint
+
+            # noinspection PyBroadException
+            try:
+                checkpoint.TrackableSaver.save = _patched_call(
+                    checkpoint.TrackableSaver.save, PatchTensorflow2ModelIO._save
+                )
+            except Exception:
+                pass
+
+            # noinspection PyBroadException
+            try:
+                checkpoint.TrackableSaver.restore = _patched_call(
+                    checkpoint.TrackableSaver.restore, PatchTensorflow2ModelIO._restore
+                )
+            except Exception:
+                pass
+        except ImportError:
+            pass
+        except Exception:
+            LoggerRoot.get_base_logger(TensorflowBinding).debug('Failed patching tensorflow v2.11')
 
     @staticmethod
     def _save(original_fn, self, file_prefix, *args, **kwargs):
@@ -2296,3 +2344,15 @@ class PatchTensorflow2ModelIO(object):
         except Exception:
             pass
         return model
+
+
+def tweak_step(step):
+    # noinspection PyBroadException
+    try:
+        step = int(step.numpy()) if not isinstance(step, int) else step
+        # unlike other frameworks, tensorflow already accounts for the iteration number
+        # when continuing the training. we substract the smallest iteration such that we
+        # don't increment the step twice number
+        return step - EventTrainsWriter._current_task.get_initial_iteration()
+    except Exception:
+        return step

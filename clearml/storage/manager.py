@@ -1,5 +1,4 @@
 import fnmatch
-import os
 import shutil
 import tarfile
 from multiprocessing.pool import ThreadPool
@@ -7,14 +6,13 @@ from random import random
 from time import time
 from typing import List, Optional, Union
 from zipfile import ZipFile
-from six.moves.urllib.parse import urlparse
 
 from pathlib2 import Path
 
 from .cache import CacheManager
 from .callbacks import ProgressReport
 from .helper import StorageHelper
-from .util import encode_string_to_filename, safe_extract
+from .util import encode_string_to_filename, safe_extract, create_zip_directories
 from ..debugging.log import LoggerRoot
 from ..config import deferred_config
 
@@ -165,7 +163,9 @@ class StorageManager(object):
                 temp_target_folder.mkdir(parents=True, exist_ok=True)
 
             if suffix == ".zip":
-                ZipFile(cached_file.as_posix()).extractall(path=temp_target_folder.as_posix())
+                zip_file = ZipFile(cached_file.as_posix())
+                create_zip_directories(zip_file, path=temp_target_folder.as_posix())
+                zip_file.extractall(path=temp_target_folder.as_posix())
             elif suffix == ".tar.gz":
                 with tarfile.open(cached_file.as_posix()) as file:
                     safe_extract(file, temp_target_folder.as_posix())
@@ -291,12 +291,21 @@ class StorageManager(object):
 
         :return: Path to downloaded file or None on error
         """
+
+        def remove_prefix_from_str(target_str, prefix_to_be_removed):
+            # type: (str, str) -> str
+            if target_str.startswith(prefix_to_be_removed):
+                return target_str[len(prefix_to_be_removed):]
+            return target_str
+
+        longest_configured_url = StorageHelper._resolve_base_url(remote_url)  # noqa
+        bucket_path = remove_prefix_from_str(remote_url[len(longest_configured_url):], "/")
+
         if not local_folder:
             local_folder = CacheManager.get_cache_manager().get_cache_folder()
-        local_path = os.path.join(
-            str(Path(local_folder).absolute()), str(Path(urlparse(remote_url).path)).lstrip(os.path.sep)
-        )
+        local_path = str(Path(local_folder).expanduser().absolute() / bucket_path)
         helper = StorageHelper.get(remote_url)
+
         return helper.download_to_file(
             remote_url,
             local_path,
@@ -341,7 +350,7 @@ class StorageManager(object):
             None if the file could not be found or an error occurred.
         """
         helper = StorageHelper.get(remote_url)
-        return helper.get_object_size_bytes(remote_url)
+        return helper.get_object_size_bytes(remote_url, silence_errors)
 
     @classmethod
     def download_folder(

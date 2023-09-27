@@ -42,7 +42,6 @@ class HyperParams(object):
                                 selector and not selector(item)
                             ):
                                 continue
-                            item = item if not projector else projector(item)
                             if return_obj:
                                 item = tasks.ParamsItem()
                             hyperparams[item.get("section")][item.get("name")] = (
@@ -118,6 +117,13 @@ class HyperParams(object):
             for i in iterables:
                 item = make_item(i)
                 props.update({item.name: item})
+
+        if self.task.is_offline():
+            hyperparams = self.task.data.hyperparams or {}
+            hyperparams.setdefault("properties", tasks.SectionParams())
+            hyperparams["properties"].update(props)
+            self.task._save_data_to_offline_dir(hyperparams=hyperparams)
+            return True
 
         res = self.task.session.send(
             tasks.EditHyperParamsRequest(

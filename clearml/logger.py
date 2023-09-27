@@ -86,11 +86,12 @@ class Logger(object):
         if disable_urllib3_info and logging.getLogger('urllib3').isEnabledFor(logging.INFO):
             logging.getLogger('urllib3').setLevel(logging.WARNING)
 
-        StdStreamPatch.patch_std_streams(self, connect_stdout=connect_stdout, connect_stderr=connect_stderr)
+        if self._task.is_main_task():
+            StdStreamPatch.patch_std_streams(self, connect_stdout=connect_stdout, connect_stderr=connect_stderr)
 
         if self._connect_logging:
             StdStreamPatch.patch_logging_formatter(self)
-        elif not self._connect_std_streams:
+        elif not self._connect_std_streams and self._task.is_main_task():
             # make sure that at least the main clearml logger is connect
             base_logger = LoggerRoot.get_base_logger()
             if base_logger and base_logger.handlers:
@@ -131,12 +132,11 @@ class Logger(object):
 
         :param str msg: The text to log.
         :param int level: The log level from the Python ``logging`` package. The default value is ``logging.INFO``.
-        :param bool print_console: In addition to the log, print to the console
-
+        :param bool print_console: In addition to the log, print to the console.
             The values are:
 
-            - ``True`` - Print to the console. (default)
-            - ``False`` - Do not print to the console.
+          - ``True`` - Print to the console. (default)
+          - ``False`` - Do not print to the console.
         """
         force_send = not print_console and self._parse_level(level) >= logging.WARNING
         return self._console(msg, level, not print_console, force_send=force_send, *args, **_)
@@ -199,6 +199,10 @@ class Logger(object):
         """
         For explicit reporting, plot a vector as (default stacked) histogram.
 
+        .. note::
+            This method is the same as :meth:`Logger.report_histogram`.
+            This method is deprecated, use :meth:`Logger.report_histogram` instead.
+
         For example:
 
         .. code-block:: py
@@ -224,6 +228,11 @@ class Logger(object):
             See full details on the supported configuration: https://plotly.com/javascript/reference/layout/
             example: extra_layout={'showlegend': False, 'plot_bgcolor': 'yellow'}
         """
+        warnings.warn(
+            ":meth:`Logger.report_vector` is deprecated;"
+            "use :meth:`Logger.report_histogram` instead.",
+            DeprecationWarning
+        )
         self._touch_title_series(title, series)
         return self.report_histogram(title, series, values, iteration or 0, labels=labels, xlabels=xlabels,
                                      xaxis=xaxis, yaxis=yaxis, mode=mode, extra_layout=extra_layout)
@@ -306,9 +315,10 @@ class Logger(object):
             csv=None,  # type: Optional[str]
             url=None,  # type: Optional[str]
             extra_layout=None,  # type: Optional[dict]
+            extra_data=None,  # type: Optional[dict]
     ):
         """
-        For explicit report, report a table plot.
+        For explicit reporting, report a table plot.
 
         One and only one of the following parameters must be provided.
 
@@ -337,7 +347,32 @@ class Logger(object):
         :param url: A URL to the location of csv file.
         :param extra_layout: optional dictionary for layout configuration, passed directly to plotly
             See full details on the supported configuration: https://plotly.com/javascript/reference/layout/
-            example: extra_layout={'height': 600}
+            For example:
+
+            .. code-block:: py
+
+                logger.report_table(
+                    title='table example',
+                    series='pandas DataFrame',
+                    iteration=0,
+                    table_plot=df,
+                    extra_layout={'height': 600}
+                )
+
+        :param extra_data: optional dictionary for data configuration, like column width, passed directly to plotly
+            See full details on the supported configuration: https://plotly.com/javascript/reference/table/
+            For example:
+
+            .. code-block:: py
+
+                logger.report_table(
+                    title='table example',
+                    series='pandas DataFrame',
+                    iteration=0,
+                    table_plot=df,
+                    extra_data={'columnwidth': [2., 1., 1., 1.]}
+                )
+
         """
         mutually_exclusive(
             UsageError, _check_none=True,
@@ -373,6 +408,7 @@ class Logger(object):
             table=reporter_table,
             iteration=iteration or 0,
             layout_config=extra_layout,
+            data_config=extra_data,
         )
 
     def report_line_plot(
@@ -396,25 +432,32 @@ class Logger(object):
         :param str xaxis: The x-axis title. (Optional)
         :param str yaxis: The y-axis title. (Optional)
         :param str mode: The type of line plot.
-
             The values are:
 
-            - ``lines`` (default)
-            - ``markers``
-            - ``lines+markers``
+          - ``lines`` (default)
+          - ``markers``
+          - ``lines+markers``
 
-        :param bool reverse_xaxis: Reverse the x-axis
-
+        :param bool reverse_xaxis: Reverse the x-axis.
             The values are:
 
-            - ``True`` - The x-axis is high to low  (reversed).
-            - ``False`` - The x-axis is low to high  (not reversed). (default)
+          - ``True`` - The x-axis is high to low  (reversed).
+          - ``False`` - The x-axis is low to high  (not reversed). (default)
 
         :param str comment: A comment displayed with the plot, underneath the title.
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
             See full details on the supported configuration: https://plotly.com/javascript/reference/scatter/
             example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
+
+        .. note::
+            This method is the same as :meth:`Logger.report_scatter2d` with :param:`mode='lines'`.
+            This method is deprecated, use :meth:`Logger.report_scatter2d` instead.
         """
+        warnings.warn(
+            ":meth:`Logger.report_line_plot` is deprecated;"
+            "use :meth:`Logger.report_scatter2d` instead, e.g., with :param:`mode='lines'`.",
+            DeprecationWarning
+        )
 
         # noinspection PyArgumentList
         series = [self.SeriesInfo(**s) if isinstance(s, dict) else s for s in series]
@@ -480,13 +523,11 @@ class Logger(object):
         :param str yaxis: The y-axis title. (Optional)
         :param list(str) labels: Labels per point in the data assigned to the ``scatter`` parameter. The labels must be
             in the same order as the data.
-        :param str mode: The type of scatter plot.
+        :param str mode: The type of scatter plot. The values are:
 
-            The values are:
-
-            - ``lines``
-            - ``markers``
-            - ``lines+markers``
+          - ``lines``
+          - ``markers``
+          - ``lines+markers``
 
         :param str comment: A comment displayed with the plot, underneath the title.
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
@@ -544,28 +585,19 @@ class Logger(object):
         :param str zaxis: The z-axis title. (Optional)
         :param list(str) labels: Labels per point in the data assigned to the ``scatter`` parameter. The labels must be
             in the same order as the data.
-        :param str mode: The type of scatter plot.
+        :param str mode: The type of scatter plot. The values are: ``lines``, ``markers``, ``lines+markers``.
+            For example:
 
-            The values are:
+            .. code-block:: py
 
-            - ``lines``
-            - ``markers``
-            - ``lines+markers``
+               scatter3d = np.random.randint(10, size=(10, 3))
+               logger.report_scatter3d(title="example_scatter_3d", series="series_xyz", iteration=1, scatter=scatter3d,
+                    xaxis="title x", yaxis="title y", zaxis="title z")
 
-        For example:
+        :param bool fill: Fill the area under the curve. The values are:
 
-        .. code-block:: py
-
-           scatter3d = np.random.randint(10, size=(10, 3))
-           logger.report_scatter3d(title="example_scatter_3d", series="series_xyz", iteration=1, scatter=scatter3d,
-                xaxis="title x", yaxis="title y", zaxis="title z")
-
-        :param bool fill: Fill the area under the curve
-
-            The values are:
-
-            - ``True`` - Fill
-            - ``False`` - Do not fill (default)
+          - ``True`` - Fill
+          - ``False`` - Do not fill (default)
 
         :param str comment: A comment displayed with the plot, underneath the title.
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
@@ -655,6 +687,9 @@ class Logger(object):
         if not isinstance(matrix, np.ndarray):
             matrix = np.array(matrix)
 
+        if extra_layout is None:
+            extra_layout = {'texttemplate': '%{z}'}
+
         # if task was not started, we have to start it
         self._start_task_if_needed()
         self._touch_title_series(title, series)
@@ -691,6 +726,7 @@ class Logger(object):
 
         .. note::
             This method is the same as :meth:`Logger.report_confusion_matrix`.
+            This method is deprecated, use :meth:`Logger.report_confusion_matrix` instead.
 
         :param str title: The title (metric) of the plot.
         :param str series: The series name (variant) of the reported confusion matrix.
@@ -700,11 +736,16 @@ class Logger(object):
         :param str yaxis: The y-axis title. (Optional)
         :param list(str) xlabels: Labels for each column of the matrix. (Optional)
         :param list(str) ylabels: Labels for each row of the matrix. (Optional)
-        :param bool yaxis_reversed: If False, 0,0 is at the bottom left corner. If True, 0,0 is at the top left corner
+        :param bool yaxis_reversed: If False, 0,0 is in the bottom left corner. If True, 0,0 is in the top left corner
         :param dict extra_layout: optional dictionary for layout configuration, passed directly to plotly
             See full details on the supported configuration: https://plotly.com/javascript/reference/heatmap/
             example: extra_layout={'xaxis': {'type': 'date', 'range': ['2020-01-01', '2020-01-31']}}
         """
+        warnings.warn(
+            ":meth:`Logger.report_matrix` is deprecated;"
+            "use :meth:`Logger.report_confusion_matrix` instead.",
+            DeprecationWarning
+        )
         self._touch_title_series(title, series)
         return self.report_confusion_matrix(title, series, matrix, iteration or 0,
                                             xaxis=xaxis, yaxis=yaxis, xlabels=xlabels, ylabels=ylabels,
@@ -819,19 +860,17 @@ class Logger(object):
         :param local_path: A path to an image file.
         :param url: A URL for the location of a pre-uploaded image.
         :param image: Image data (RGB).
-        :param matrix: Deperacted, Image data (RGB).
+        :param matrix: Deprecated, Image data (RGB).
 
             .. note::
                The ``matrix`` parameter is deprecated. Use the ``image`` parameters.
         :param max_image_history: The maximum number of images to store per metric/variant combination.
             For an unlimited number, use a negative value. The default value is set in global configuration
             (default=``5``).
-        :param delete_after_upload: After the upload, delete the local copy of the image
+        :param delete_after_upload: After the upload, delete the local copy of the image. The values are:
 
-            The values are:
-
-            - ``True`` - Delete after upload.
-            - ``False`` - Do not delete after upload. (default)
+          - ``True`` - Delete after upload.
+          - ``False`` - Do not delete after upload. (default)
         """
         mutually_exclusive(
             UsageError, _check_none=True,
@@ -1054,7 +1093,7 @@ class Logger(object):
 
         :param str uri: example: 's3://bucket/directory/' or 'file:///tmp/debug/'
 
-        :return: True, if the destination scheme is supported (for example, ``s3://``, ``file://``, or ``gc://``).
+        :return: True, if the destination scheme is supported (for example, ``s3://``, ``file://``, or ``gs://``).
             False, if not supported.
 
         """
@@ -1128,7 +1167,7 @@ class Logger(object):
         `report_image`, `report_media` etc. without specifying `max_history`
 
         :param max_history: Number of samples (files) to store on a unique set of title/series being reported
-            with different iteration counter. This is used to make sure users do not end up exploding storage
+            with different iteration counters. This is used to make sure users do not end up exploding storage
             on server storage side.
 
             For example the following code sample will store the last 5 images even though
@@ -1148,10 +1187,10 @@ class Logger(object):
         # type: () -> int
         """
         Return the default max debug sample history when reporting media/debug samples.
-        If value was not set specifically, the functions returns the configuration file default value.
+        If value was not set specifically, the function returns the configuration file default value.
 
         :return: default number of samples (files) to store on a unique set of title/series being reported
-            with different iteration counter. This is used to make sure users do not end up exploding storage
+            with different iteration counters. This is used to make sure users do not end up exploding storage
             on server storage side.
         """
         if self._default_max_sample_history is not None:
@@ -1237,7 +1276,7 @@ class Logger(object):
     def matplotlib_force_report_non_interactive(cls, force):
         # type: (bool) -> None
         """
-        If True, all matplotlib are always converted to non interactive static plots (images), appearing in under
+        If True, all matplotlib are always converted to non-interactive static plots (images), appearing in under
         the Plots section. If False (default), matplotlib figures are converted into interactive web UI plotly
         figures, in case figure conversion fails, it defaults to non-interactive plots.
 

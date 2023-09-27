@@ -8,7 +8,7 @@
 </br>Experiment Manager, MLOps and Data-Management**
 
 [![GitHub license](https://img.shields.io/github/license/allegroai/clearml.svg)](https://img.shields.io/github/license/allegroai/clearml.svg) [![PyPI pyversions](https://img.shields.io/pypi/pyversions/clearml.svg)](https://img.shields.io/pypi/pyversions/clearml.svg) [![PyPI version shields.io](https://img.shields.io/pypi/v/clearml.svg)](https://pypi.org/project/clearml/) [![Conda version shields.io](https://img.shields.io/conda/v/clearml/clearml)](https://anaconda.org/clearml/clearml) [![Optuna](https://img.shields.io/badge/Optuna-integrated-blue)](https://optuna.org)<br>
-[![PyPI Downloads](https://pepy.tech/badge/clearml/month)](https://pypi.org/project/clearml/) [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/allegroai)](https://artifacthub.io/packages/search?repo=allegroai) [![Youtube](https://img.shields.io/badge/ClearML-DD0000?logo=youtube&logoColor=white)](https://www.youtube.com/c/clearml) [![Slack Channel](https://img.shields.io/badge/slack-%23clearml--community-blueviolet?logo=slack)](https://join.slack.com/t/clearml/shared_invite/zt-1kvcxu5hf-SRH_rmmHdLL7l2WadRJTQg) [![Signup](https://img.shields.io/badge/Clear%7CML-Signup-brightgreen)](https://app.clear.ml)
+[![PyPI Downloads](https://static.pepy.tech/badge/clearml/month)](https://pypi.org/project/clearml/) [![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/allegroai)](https://artifacthub.io/packages/search?repo=allegroai) [![Youtube](https://img.shields.io/badge/ClearML-DD0000?logo=youtube&logoColor=white)](https://www.youtube.com/c/clearml) [![Slack Channel](https://img.shields.io/badge/slack-%23clearml--community-blueviolet?logo=slack)](https://joinslack.clear.ml) [![Signup](https://img.shields.io/badge/Clear%7CML-Signup-brightgreen)](https://app.clear.ml)
 
 </div>
 
@@ -16,7 +16,7 @@
 ### ClearML
 <sup>*Formerly known as Allegro Trains*<sup>
 
-ClearML is a ML/DL development and production suite, it contains FIVE main modules:
+ClearML is a ML/DL development and production suite. It contains FIVE main modules:
 
 - [Experiment Manager](#clearml-experiment-manager) - Automagical experiment tracking, environments and results
 - [MLOps](https://github.com/allegroai/clearml-agent) - Orchestration, Automation & Pipelines solution for ML/DL jobs (K8s / Cloud / bare-metal)  
@@ -35,7 +35,33 @@ Instrumenting these components is the **ClearML-server**, see [Self-Hosting](htt
 ---
 <div align="center">
 
-**[Sign up](https://app.clear.ml)  &  [Start using](https://clear.ml/docs/) in under 2 minutes**  
+**[Sign up](https://app.clear.ml)  &  [Start using](https://clear.ml/docs/) in under 2 minutes**
+
+---
+**Friendly tutorials to get you started**
+
+<table>
+<tbody>
+  <tr>
+    <td><a href="https://github.com/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_1_Experiment_Management.ipynb"><b>Step 1</b></a> - Experiment Management</td>
+    <td><a target="_blank" href="https://colab.research.google.com/github/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_1_Experiment_Management.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+</a></td>
+  </tr>
+  <tr>
+    <td><a href="https://github.com/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_2_Setting_Up_Agent.ipynb"><b>Step 2</b></a> - Remote Execution Agent Setup</td>
+    <td><a target="_blank" href="https://colab.research.google.com/github/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_2_Setting_Up_Agent.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+</a></td>
+  </tr>
+  <tr>
+    <td><a href="https://github.com/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_3_Remote_Execution.ipynb"><b>Step 3</b></a> - Remotely Execute Tasks</td>
+    <td><a target="_blank" href="https://colab.research.google.com/github/allegroai/clearml/blob/master/docs/tutorials/Getting_Started_3_Remote_Execution.ipynb">
+  <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/>
+</a></td>
+  </tr>
+</tbody>
+</table>
 
 </div>
 
@@ -47,10 +73,10 @@ Instrumenting these components is the **ClearML-server**, see [Self-Hosting](htt
 **Adding only 2 lines to your code gets you the following**
 
 * Complete experiment setup log
-    * Full source control info including non-committed local changes
+    * Full source control info, including non-committed local changes
     * Execution environment (including specific packages & versions)
     * Hyper-parameters
-        * ArgParser/[Click](https://github.com/pallets/click/) for command line parameters with currently used values
+        * [`argparse`](https://docs.python.org/3/library/argparse.html)/[Click](https://github.com/pallets/click/)/[PythonFire](https://github.com/google/python-fire) for command line parameters with currently used values
         * Explicit parameters dictionary
         * Tensorflow Defines (absl-py)
         * [Hydra](https://github.com/facebookresearch/hydra) configuration and overrides
@@ -96,7 +122,7 @@ below and follow the instructions:
     task = Task.init(project_name='examples', task_name='hello world')
     ```
 
-You are done, everything your process outputs is now automagically logged into ClearML.
+And you are done! Everything your process outputs is now automagically logged into ClearML.
 
 Next step, automation! **Learn more about ClearML's two-click automation [here](https://clear.ml/docs/latest/docs/getting_started/mlops/mlops_first_steps)**. 
 
@@ -104,9 +130,9 @@ Next step, automation! **Learn more about ClearML's two-click automation [here](
 
 The ClearML run-time components:
 
-* The ClearML Python Package for integrating ClearML into your existing scripts by adding just two lines of code, and optionally extending your experiments and other workflows with ClearML powerful and versatile set of classes and methods.
-* The ClearML Server storing experiment, model, and workflow data, and supporting the Web UI experiment manager, and ML-Ops automation for reproducibility and tuning. It is available as a hosted service and open source for you to deploy your own ClearML Server.
-* The ClearML Agent for ML-Ops orchestration, experiment and workflow reproducibility, and scalability.
+* The ClearML Python Package - for integrating ClearML into your existing scripts by adding just two lines of code, and optionally extending your experiments and other workflows with ClearML's powerful and versatile set of classes and methods.
+* The ClearML Server - for storing experiment, model, and workflow data; supporting the Web UI experiment manager and MLOps automation for reproducibility and tuning. It is available as a hosted service and open source for you to deploy your own ClearML Server.
+* The ClearML Agent - for MLOps orchestration, experiment and workflow reproducibility, and scalability.
 
 <img src="https://raw.githubusercontent.com/allegroai/clearml-docs/main/docs/img/clearml_architecture.png" width="100%" alt="clearml-architecture">
 
@@ -116,7 +142,7 @@ The ClearML run-time components:
 - [clearml-task](https://github.com/allegroai/clearml/blob/master/docs/clearml-task.md) - Run any codebase on remote machines with full remote logging of Tensorboard, Matplotlib & Console outputs 
 - [clearml-data](https://github.com/allegroai/clearml/blob/master/docs/datasets.md) - **CLI for managing and versioning your datasets, including creating / uploading / downloading of data from S3/GS/Azure/NAS** 
 - [AWS Auto-Scaler](https://clear.ml/docs/latest/docs/guides/services/aws_autoscaler) - Automatically spin EC2 instances based on your workloads with preconfigured budget! No need for K8s!
-- [Hyper-Parameter Optimization](https://clear.ml/docs/latest/docs/guides/optimization/hyper-parameter-optimization/examples_hyperparam_opt) - Optimize any code with black-box approach and state of the art Bayesian optimization algorithms 
+- [Hyper-Parameter Optimization](https://clear.ml/docs/latest/docs/guides/optimization/hyper-parameter-optimization/examples_hyperparam_opt) - Optimize any code with black-box approach and state-of-the-art Bayesian optimization algorithms
 - [Automation Pipeline](https://clear.ml/docs/latest/docs/guides/pipeline/pipeline_controller) - Build pipelines based on existing experiments / jobs, supports building pipelines of pipelines!  
 - [Slack Integration](https://clear.ml/docs/latest/docs/guides/services/slack_alerts) - Report experiments progress / failure directly to Slack (fully customizable!)  
 
@@ -133,22 +159,20 @@ and practices.
   - Use it on a daily basis to boost collaboration and visibility in your team 
   - Create a remote job from any experiment with a click of a button
   - Automate processes and create pipelines to collect your experimentation logs, outputs, and data
-  - Store all you data on any object-storage solution, with the simplest interface possible
-  - Make you data transparent by cataloging it all on the ClearML platform    
+  - Store all your data on any object-storage solution, with the most straightforward interface possible
+  - Make your data transparent by cataloging it all on the ClearML platform
 
 We believe ClearML is ground-breaking. We wish to establish new standards of true seamless integration between
-experiment management,ML-Ops and data management. 
+experiment management, MLOps, and data management.
 
 ## Who We Are
 
-ClearML is supported by the team behind [clear.ml](https://clear.ml),
-where we build deep learning pipelines and infrastructure for enterprise companies.
+ClearML is supported by you and the [clear.ml](https://clear.ml) team, which helps enterprise companies build scalable MLOps. 
 
 We built ClearML to track and control the glorious but messy process of training production-grade deep learning models.
 We are committed to vigorously supporting and expanding the capabilities of ClearML.
 
-We promise to always be backwardly compatible, making sure all your logs, data and pipelines 
-will always upgrade with you.
+We promise to always be backwardly compatible, making sure all your logs, data, and pipelines will always upgrade with you.
 
 ## License
 
@@ -167,12 +191,11 @@ author = {ClearML},
 
 ## Documentation, Community & Support
 
-More information in the [official documentation](https://clear.ml/docs) and [on YouTube](https://www.youtube.com/c/ClearML).
+For more information, see the [official documentation](https://clear.ml/docs) and [on YouTube](https://www.youtube.com/c/ClearML).
 
 For examples and use cases, check the [examples folder](https://github.com/allegroai/clearml/tree/master/examples) and [corresponding documentation](https://clear.ml/docs/latest/docs/guides).
 
-If you have any questions: post on our [Slack Channel](https://join.slack.com/t/clearml/shared_invite/zt-1kvcxu5hf-SRH_rmmHdLL7l2WadRJTQg
-), or tag your questions on [stackoverflow](https://stackoverflow.com/questions/tagged/clearml) with '**[clearml](https://stackoverflow.com/questions/tagged/clearml)**' tag (*previously [trains](https://stackoverflow.com/questions/tagged/trains) tag*).
+If you have any questions: post on our [Slack Channel](https://joinslack.clear.ml), or tag your questions on [stackoverflow](https://stackoverflow.com/questions/tagged/clearml) with '**[clearml](https://stackoverflow.com/questions/tagged/clearml)**' tag (*previously [trains](https://stackoverflow.com/questions/tagged/trains) tag*).
 
 For feature requests or bug reports, please use [GitHub issues](https://github.com/allegroai/clearml/issues).
 

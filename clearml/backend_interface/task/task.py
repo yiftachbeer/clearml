@@ -3,7 +3,6 @@ import itertools
 import json
 import logging
 import os
-import re
 import sys
 import warnings
 from copy import copy
@@ -34,12 +33,12 @@ from ...backend_interface.task.development.worker import DevWorker
 from ...backend_interface.session import SendError
 from ...backend_api import Session
 from ...backend_api.services import tasks, models, events, projects
-from ...backend_api.session.defs import ENV_OFFLINE_MODE
+# from ...backend_api.session.defs import ENV_OFFLINE_MODE
 from ...utilities.pyhocon import ConfigTree, ConfigFactory
 from ...utilities.config import config_dict_to_text, text_to_config_dict
 from ...errors import ArtifactUriDeleteError
 
-from ..base import IdObjectBase, InterfaceBase
+from ..base import IdObjectBase  # , InterfaceBase
 from ..metrics import Metrics, Reporter
 from ..model import Model
 from ..setupuploadmixin import SetupUploadMixin
@@ -56,6 +55,9 @@ from .repo import ScriptInfo, pip_freeze
 from .hyperparams import HyperParams
 from ...config import config, PROC_MASTER_ID_ENV_VAR, SUPPRESS_UPDATE_MESSAGE_ENV_VAR, DOCKER_BASH_SETUP_ENV_VAR
 from ...utilities.process.mp import SingletonLock
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ...model import BaseModel
 
 
 class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
@@ -152,6 +154,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         :param force_create: If True, a new task will always be created (task_id, if provided, will be ignored)
         :type force_create: bool
         """
+        self._offline_output_models = []
         SingletonLock.instantiate()
         task_id = self._resolve_task_id(task_id, log=log) if not force_create else None
         self.__edit_lock = None
@@ -170,6 +173,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         self._initial_iteration_offset = 0
         self._reload_skip_flag = False
         self._calling_filename = None
+        self._offline_dir = None
 
         if not task_id:
             # generate a new task
@@ -364,7 +368,12 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         )
         res = self.send(req)
 
-        return res.response.id if res else 'offline-{}'.format(str(uuid4()).replace("-", ""))
+        if res:
+            return res.response.id
+
+        id = "offline-{}".format(str(uuid4()).replace("-", ""))
+        self._edit(type=tasks.TaskTypeEnum(task_type))
+        return id
 
     def _set_storage_uri(self, value):
         value = value.rstrip('/') if value else None
@@ -633,6 +642,23 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             res = self.send(tasks.GetByIdRequest(task=self.id))
             return res.response.task
 
+    def _reload_field(self, field):
+        # type: (str) -> Any
+        """ Reload the task specific field, dot seperated for nesting"""
+        with self._edit_lock:
+            if self._offline_mode:
+                task_object = self._reload()
+            else:
+                res = self.send(tasks.GetAllRequest(id=[self.id], only_fields=[field], search_hidden=True))
+                task_object = res.response.tasks[0]
+
+            for p in field.split("."):
+                task_object = getattr(task_object, p, None)
+                if task_object is None:
+                    break
+
+            return task_object
+
     def reset(self, set_started_on_success=True, force=False):
         # type: (bool, bool) -> ()
         """
@@ -674,22 +700,56 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     def mark_completed(self, ignore_errors=True, status_message=None, force=False):
         # type: (bool, Optional[str], bool) -> ()
         """
-        Manually mark a Task as completed. This will close the running process and will change the Task's status
-        to Completed (Use this function to close and change status of remotely executed tasks).
-        To simply change the Task's status to completed, use task.close()
+        Use this method to close and change status of (remotely!) executed tasks.
 
-        :param bool ignore_errors: If True default), ignore any errors raised
+        This method closes the task it is a member of,
+        changes its status to "Completed", and
+        terminates the Python process that created the task.
+        This is in contrast to :meth:`Task.close`, which does the first two steps, but does not terminate any Python process.
+
+        Let's say that process A created the task and process B has a handle on the task, e.g., with :meth:`Task.get_task`.
+        Then, if we call :meth:`Task.mark_completed`, process A is terminated, but process B is not.
+
+        However, if :meth:`Task.mark_completed` was called from the same process in which the task was created,
+        then - effectively - the process terminates itself.
+        For example, in
+
+        .. code-block:: py
+
+            task = Task.init(...)
+            task.mark_completed()
+            from time import sleep
+            sleep(30)
+            print('This text will not be printed!')
+
+        the text will not be printed, because the Python process is immediately terminated.
+
+        :param bool ignore_errors: If True (default), ignore any errors raised
         :param bool force: If True, the task status will be changed to `stopped` regardless of the current Task state.
         :param str status_message: Optional, add status change message to the stop request.
             This message will be stored as status_message on the Task's info panel
         """
         if hasattr(tasks, 'CompletedRequest') and callable(tasks.CompletedRequest):
-            return self.send(
-                tasks.CompletedRequest(
-                    self.id, status_reason='completed', status_message=status_message, force=force,
-                    publish=True if self._get_runtime_properties().get("_publish_on_complete") else False),
-                ignore_errors=ignore_errors
-            )
+            if Session.check_min_api_version('2.20'):
+                return self.send(
+                    tasks.CompletedRequest(
+                        self.id, status_reason='completed', status_message=status_message, force=force,
+                        publish=True if self._get_runtime_properties().get("_publish_on_complete") else False),
+                    ignore_errors=ignore_errors
+                )
+            else:
+                resp = self.send(
+                    tasks.CompletedRequest(
+                        self.id, status_reason='completed', status_message=status_message, force=force),
+                    ignore_errors=ignore_errors)
+
+                if self._get_runtime_properties().get("_publish_on_complete"):
+                    self.send(
+                        tasks.PublishRequest(
+                            self.id, status_reason='completed', status_message=status_message, force=force),
+                        ignore_errors=ignore_errors)
+
+                return resp
         return self.send(
             tasks.StoppedRequest(self.id, status_reason='completed', status_message=status_message, force=force),
             ignore_errors=ignore_errors
@@ -707,7 +767,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
     def publish(self, ignore_errors=True):
         # type: (bool) -> ()
         """ The signal that this task will be published """
-        if str(self.status) not in (str(tasks.TaskStatusEnum.stopped), str(tasks.TaskStatusEnum.completed)):
+        if self.status not in (self.TaskStatusEnum.stopped, self.TaskStatusEnum.completed):
             raise ValueError("Can't publish, Task is not stopped")
         resp = self.send(tasks.PublishRequest(self.id), ignore_errors=ignore_errors)
         assert isinstance(resp.response, tasks.PublishResponse)
@@ -747,7 +807,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         try:
             res = self.send(tasks.GetByIdRequest(self.task_id))
             task = res.response.task
-            if task.status == Task.TaskStatusEnum.published:
+            if task.status == self.TaskStatusEnum.published:
                 if raise_on_error:
                     raise self.DeleteError("Cannot delete published task {}".format(self.task_id))
                 self.log.error("Cannot delete published task {}".format(self.task_id))
@@ -986,7 +1046,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         Set a new input model for the Task. The model must be "ready" (status is ``Published``) to be used as the
         Task's input model.
 
-        :param model_id: The Id of the model on the **ClearML Server** (backend). If ``model_name`` is not specified,
+        :param model_id: The ID of the model on the **ClearML Server** (backend). If ``model_name`` is not specified,
             then ``model_id`` must be specified.
         :param model_name: The model name in the artifactory. The model_name is used to locate an existing model
             in the **ClearML Server** (backend). If ``model_id`` is not specified,
@@ -1099,7 +1159,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         Notice the parameter dict is flat:
         i.e. {'Args/param': 'value'} will set the argument "param" in section "Args" to "value"
 
-        :param args: Positional arguments, which are one or more dictionary or (key, value) iterable. They are
+        :param args: Positional arguments, which are one or more dictionaries or (key, value) iterable. They are
             merged into a single key-value pair dictionary.
         :param kwargs: Key-value pairs, merged into the parameters dictionary created from ``args``.
         """
@@ -1111,7 +1171,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         Set the parameters for a Task. This method sets a complete group of key-value parameter pairs, but does not
         support parameter descriptions (the input is a dictionary of key-value pairs).
 
-        :param args: Positional arguments, which are one or more dictionary or (key, value) iterable. They are
+        :param args: Positional arguments, which are one or more dictionaries or (key, value) iterable. They are
             merged into a single key-value pair dictionary.
         :param kwargs: Key-value pairs, merged into the parameters dictionary created from ``args``.
         """
@@ -1122,24 +1182,11 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
 
             str_value = str(value)
             if isinstance(value, (tuple, list, dict)):
-                if 'None' in re.split(r'[ ,\[\]{}()]', str_value):
-                    # If we have None in the string we have to use json to replace it with null,
-                    # otherwise we end up with None as string when running remotely
-                    try:
-                        str_json = json.dumps(value)
-                        # verify we actually have a null in the string, otherwise prefer the str cast
-                        # This is because we prefer to have \' as in str and not \" used in json
-                        if 'null' in re.split(r'[ ,\[\]{}()]', str_json):
-                            return str_json
-                    except TypeError:
-                        # if we somehow failed to json serialize, revert to previous std casting
-                        pass
-                elif any('\\' in str(v) for v in value):
-                    try:
-                        str_json = json.dumps(value)
-                        return str_json
-                    except TypeError:
-                        pass
+                try:
+                    str_json = json.dumps(value)
+                    return str_json
+                except TypeError:
+                    pass
 
             if isinstance(value, Enum):
                 # remove the class name
@@ -1284,16 +1331,17 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             __parameters_types={name: value_type}
         )
 
-    def get_parameter(self, name, default=None):
-        # type: (str, Any) -> Any
+    def get_parameter(self, name, default=None, cast=False):
+        # type: (str, Any, bool) -> Any
         """
         Get a value for a parameter.
 
         :param name: Parameter name
         :param default: Default value
+        :param cast: If value is found, cast to original type. If False, return string.
         :return: The Parameter value (or default value if parameter is not defined).
         """
-        params = self.get_parameters()
+        params = self.get_parameters(cast=cast)
         return params.get(name, default)
 
     def delete_parameter(self, name):
@@ -1325,7 +1373,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         Notice the parameter dict is flat:
         i.e. {'Args/param': 'value'} will set the argument "param" in section "Args" to "value"
 
-        :param args: Positional arguments, which are one or more dictionary or (key, value) iterable. They are
+        :param args: Positional arguments, which are one or more dictionaries or (key, value) iterable. They are
             merged into a single key-value pair dictionary.
         :param kwargs: Key-value pairs, merged into the parameters dictionary created from ``args``.
         """
@@ -1349,6 +1397,22 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                 raise ValueError('Expected label to be a dict[str => int]')
             execution.model_labels = enumeration
             self._edit(execution=execution)
+
+    def remove_input_models(self, models_to_remove):
+        # type: (Sequence[Union[str, BaseModel]]) -> ()
+        """
+        Remove input models from the current task. Note that the models themselves are not deleted,
+        but the tasks' reference to the models is removed.
+        To delete the models themselves, see `Models.remove`
+
+        :param models_to_remove: The models to remove from the task. Can be a list of ids,
+            or of `BaseModel` (including its subclasses: `Model` and `InputModel`)
+        """
+        ids_to_remove = [model if isinstance(model, str) else model.id for model in models_to_remove]
+        with self._edit_lock:
+            self.reload()
+            self.data.models.input = [model for model in self.data.models.input if model.model not in ids_to_remove]
+            self._edit(models=self.data.models)
 
     def _set_default_docker_image(self):
         # type: () -> ()
@@ -1430,7 +1494,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         :param repo: Remote URL for the repository to use, OR path to local copy of the git repository
             Example: 'https://github.com/allegroai/clearml.git' or '~/project/repo'
         :param branch: Optional, specify the remote repository branch (Ignored, if local repo path is used)
-        :param commit: Optional, specify the repository commit id (Ignored, if local repo path is used)
+        :param commit: Optional, specify the repository commit ID (Ignored, if local repo path is used)
         """
         if not repo:
             return
@@ -1514,7 +1578,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         :param list artifact_names: list of artifact names
         :param bool raise_on_errors: if True, do not suppress connectivity related exceptions
         :param bool delete_from_storage: If True, try to delete the actual
-        file from the external storage (e.g. S3, GS, Azure, File Server etc.)
+            file from the external storage (e.g. S3, GS, Azure, File Server etc.)
 
         :return: True if successful
         """
@@ -1636,6 +1700,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         # type: (Optional[int]) -> ()
         """
         Set the default random seed for any new initialized tasks
+
         :param random_seed: If None or False, disable random seed initialization. If True, use the default random seed,
           otherwise use the provided int value for random seed initialization when initializing a new task.
         """
@@ -1750,7 +1815,8 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         # type: (Optional[Union[str, Task]]) -> ()
         """
         Set the parent task for the Task.
-        :param parent: The parent task id (or parent Task object) for the Task. Set None for no parent.
+
+        :param parent: The parent task ID (or parent Task object) for the Task. Set None for no parent.
         :type parent: str or Task
         """
         if parent:
@@ -1865,14 +1931,11 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         Return The task status without refreshing the entire Task object (only the status property)
 
         TaskStatusEnum: ["created", "in_progress", "stopped", "closed", "failed", "completed",
-                         "queued", "published", "publishing", "unknown"]
+        "queued", "published", "publishing", "unknown"]
 
         :return: str: Task status as string (TaskStatusEnum)
         """
-        status, status_message = self._get_status()
-        if self._data:
-            self._data.status = status
-            self._data.status_message = str(status_message)
+        status, status_message = self.get_status_message()
 
         return str(status)
 
@@ -1884,10 +1947,10 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
 
         :return: http/s URL link.
         """
-        return '{}/projects/{}/experiments/{}/output/log'.format(
-            self._get_app_server(),
-            self.project if self.project is not None else '*',
-            self.id,
+        return self.get_task_output_log_web_page(
+            task_id=self.id,
+            project_id=self.project,
+            app_server_host=self._get_app_server()
         )
 
     def get_reported_scalars(
@@ -1905,6 +1968,11 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
            This call is not cached, any call will retrieve all the scalar reports from the back-end.
            If the Task has many scalars reported, it might take long for the call to return.
 
+        .. note::
+           Calling this method will return potentially downsampled scalars. The maximum number of returned samples is 5000.
+           Even when setting `max_samples` to a value larger than 5000, it will be limited to at most 5000 samples.
+           To fetch all scalar values, please see the :meth:`Task.get_all_reported_scalars`.
+
         Example:
 
         .. code-block:: py
@@ -1914,12 +1982,13 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
                       "y": [10, 11 ,12]
           }}}
 
-        :param int max_samples: Maximum samples per series to return. Default is 0 returning all scalars.
+        :param int max_samples: Maximum samples per series to return. Default is 0 returning up to 5000 samples.
             With sample limit, average scalar values inside sampling window.
         :param str x_axis: scalar x_axis, possible values:
-            'iter': iteration (default), 'timestamp': seconds from start, 'iso_time': absolute time
+            'iter': iteration (default), 'timestamp': timestamp as milliseconds since epoch, 'iso_time': absolute time
         :return: dict: Nested scalar graphs: dict[title(str), dict[series(str), dict[axis(str), list(float)]]]
         """
+
         if x_axis not in ('iter', 'timestamp', 'iso_time'):
             raise ValueError("Scalar x-axis supported values are: 'iter', 'timestamp', 'iso_time'")
 
@@ -1937,6 +2006,57 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             return {}
 
         return response.response_data
+
+    def get_all_reported_scalars(self, x_axis='iter'):
+        # type: (str) -> Mapping[str, Mapping[str, Mapping[str, Sequence[float]]]]
+        """
+        Return a nested dictionary for the all scalar graphs, containing all the registered samples,
+        where the first key is the graph title and the second is the series name.
+        Value is a dict with 'x': values and 'y': values.
+        To fetch downsampled scalar values, please see the :meth:`Task.get_reported_scalars`.
+
+        .. note::
+           This call is not cached, any call will retrieve all the scalar reports from the back-end.
+           If the Task has many scalars reported, it might take long for the call to return.
+
+        :param str x_axis: scalar x_axis, possible values:
+            'iter': iteration (default), 'timestamp': timestamp as milliseconds since epoch, 'iso_time': absolute time
+        :return: dict: Nested scalar graphs: dict[title(str), dict[series(str), dict[axis(str), list(float)]]]
+        """
+        reported_scalars = {}
+        batch_size = 1000
+        scroll_id = None
+        while True:
+            response = self.send(
+                events.GetTaskEventsRequest(
+                    task=self.id, event_type="training_stats_scalar", scroll_id=scroll_id, batch_size=batch_size
+                )
+            )
+            if not response:
+                return reported_scalars
+            response = response.wait()
+            if not response.ok() or not response.response_data:
+                return reported_scalars
+            response = response.response_data
+            for event in response.get("events", []):
+                metric = event["metric"]
+                variant = event["variant"]
+                if x_axis in ["timestamp", "iter"]:
+                    x_val = event[x_axis]
+                else:
+                    x_val = datetime.utcfromtimestamp(event["timestamp"] / 1000).isoformat(timespec="milliseconds") + "Z"
+                y_val = event["value"]
+                reported_scalars.setdefault(metric, {})
+                reported_scalars[metric].setdefault(variant, {"name": variant, "x": [], "y": []})
+                if len(reported_scalars[metric][variant]["x"]) == 0 or reported_scalars[metric][variant]["x"][-1] != x_val:
+                    reported_scalars[metric][variant]["x"].append(x_val)
+                    reported_scalars[metric][variant]["y"].append(y_val)
+                else:
+                    reported_scalars[metric][variant]["y"][-1] = y_val
+            if response.get("returned", 0) < batch_size or not response.get("scroll_id"):
+                break
+            scroll_id = response["scroll_id"]
+        return reported_scalars
 
     def get_reported_plots(
             self,
@@ -2052,8 +2172,8 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         Get the Task's configuration object section as a blob of text
         Use only for automation (externally), otherwise use `Task.connect_configuration`.
 
-        :return: The Task's configurations as a
-        dict (config name as key) and text blob as value (unconstrained text string)
+        :return: The Task's configurations as a dict (config name as key) and text blob as value (unconstrained text
+            string)
         """
         if not Session.check_min_api_version('2.9'):
             raise ValueError(
@@ -2142,8 +2262,8 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         return ret_projects
 
     @classmethod
-    def get_project_id(cls, project_name):
-        # type: (str) -> Optional[str]
+    def get_project_id(cls, project_name, search_hidden=True):
+        # type: (str, bool) -> Optional[str]
         """
         Return a project's unique ID (str).
         If more than one project matched the project_name, return the last updated project
@@ -2153,9 +2273,14 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         """
         assert project_name
         assert isinstance(project_name, str)
+        extra = {"search_hidden": search_hidden} if Session.check_min_api_version("2.20") else {}
         res = cls._send(
             cls._get_default_session(),
-            projects.GetAllRequest(order_by=['last_update'], name=exact_match_regex(project_name)),
+            projects.GetAllRequest(
+                order_by=['last_update'],
+                name=exact_match_regex(project_name),
+                **extra
+            ),
             raise_on_errors=False)
         if res and res.response and res.response.projects:
             return [projects.Project(**p.to_dict()).id for p in res.response.projects][0]
@@ -2228,8 +2353,8 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         Notice: Must be called before `Task.init` !
 
         :param force: Set force using `pip freeze` flag on/off
-        :param requirements_file: Optional pass requirements.txt file to use
-        (instead of `pip freeze` or automatic analysis)
+        :param requirements_file: Optional pass requirements.txt file to use (instead of `pip freeze` or automatic
+            analysis)
         """
         cls._force_use_pip_freeze = requirements_file if requirements_file else bool(force)
 
@@ -2259,19 +2384,55 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
             self._files_server = Session.get_files_server_host()
         return self._files_server
 
+    def get_status_message(self):
+        # type: () -> (Optional[str], Optional[str])
+        """
+        Return The task status without refreshing the entire Task object (only the status property)
+        Return also the last message coupled with the status change
+
+        Task Status options: ["created", "in_progress", "stopped", "closed", "failed", "completed",
+        "queued", "published", "publishing", "unknown"]
+        Message: is a string
+
+        :return: (Task status as string, last message)
+        """
+        status, status_message, _ = self._get_tasks_status([self.id])[0]
+        if self._data and status:
+            self._data.status = status
+            self._data.status_message = status_message
+
+        return status, status_message
+
     def _get_status(self):
         # type: () -> (Optional[str], Optional[str])
-        if self._offline_mode:
-            return tasks.TaskStatusEnum.created, 'offline'
+        """
+        retrieve Task status & message, But do not update the Task local status
+        this is important if we want to query in the background without breaking Tasks consistency
+
+        backwards compatibility,
+        :return: (status enum as string or None, str or None)
+        """
+        status, status_message, _ = self._get_tasks_status([self.id])[0]
+        return status, status_message
+
+    @classmethod
+    def _get_tasks_status(cls, ids):
+        # type: (List[str]) -> List[(Optional[str], Optional[str], Optional[str])]
+        """
+        :param ids: task IDs (str) to query
+        :return: list of tuples (status, status_message, task_id)
+        """
+        if cls._offline_mode:
+            return [(cls.TaskStatusEnum.created, "offline", i) for i in ids]
 
         # noinspection PyBroadException
         try:
-            all_tasks = self.send(
-                tasks.GetAllRequest(id=[self.id], only_fields=['status', 'status_message']),
+            all_tasks = cls._get_default_session().send(
+                tasks.GetAllRequest(id=ids, only_fields=["status", "status_message", "id"]),
             ).response.tasks
-            return all_tasks[0].status, all_tasks[0].status_message
+            return [(task.status, task.status_message, task.id) for task in all_tasks]
         except Exception:
-            return None, None
+            return [(None, None, None) for _ in ids]
 
     def _get_last_update(self):
         # type: () -> (Optional[datetime])
@@ -2313,7 +2474,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         return True
 
     def _get_runtime_properties(self):
-        # type: () -> Mapping[str, str]
+        # type: () -> Dict[str, str]
         if not Session.check_min_api_version('2.13'):
             return dict()
         return dict(**self.data.runtime) if self.data.runtime else dict()
@@ -2376,24 +2537,32 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         """
         return running_remotely() and get_remote_task_id() == self.id
 
+    def _save_data_to_offline_dir(self, **kwargs):
+        # type: (**Any) -> ()
+        for k, v in kwargs.items():
+            setattr(self.data, k, v)
+        offline_mode_folder = self.get_offline_mode_folder()
+        if not offline_mode_folder:
+            return
+        Path(offline_mode_folder).mkdir(parents=True, exist_ok=True)
+        with open((offline_mode_folder / self._offline_filename).as_posix(), "wt") as f:
+            export_data = self.data.to_dict()
+            export_data["project_name"] = self.get_project_name()
+            export_data["offline_folder"] = self.get_offline_mode_folder().as_posix()
+            export_data["offline_output_models"] = self._offline_output_models
+            json.dump(export_data, f, ensure_ascii=True, sort_keys=True)
+
     def _edit(self, **kwargs):
         # type: (**Any) -> Any
         with self._edit_lock:
             if self._offline_mode:
-                for k, v in kwargs.items():
-                    setattr(self.data, k, v)
-                Path(self.get_offline_mode_folder()).mkdir(parents=True, exist_ok=True)
-                with open((self.get_offline_mode_folder() / self._offline_filename).as_posix(), "wt") as f:
-                    export_data = self.data.to_dict()
-                    export_data["project_name"] = self.get_project_name()
-                    export_data["offline_folder"] = self.get_offline_mode_folder().as_posix()
-                    json.dump(export_data, f, ensure_ascii=True, sort_keys=True)
+                self._save_data_to_offline_dir(**kwargs)
                 return None
 
             # Since we ae using forced update, make sure he task status is valid
             status = self._data.status if self._data and self._reload_skip_flag else self.data.status
             if not kwargs.pop("force", False) and \
-                    status not in (tasks.TaskStatusEnum.created, tasks.TaskStatusEnum.in_progress):
+                    status not in (self.TaskStatusEnum.created, self.TaskStatusEnum.in_progress):
                 # the exception being name/comment that we can always change.
                 if kwargs and all(
                     k in ("name", "project", "comment", "tags", "system_tags", "runtime") for k in kwargs.keys()
@@ -2509,9 +2678,14 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         Return the folder where all the task outputs and logs are stored in the offline session.
         :return: Path object, local folder, later to be used with `report_offline_session()`
         """
+        if not self.task_id:
+            return None
+        if self._offline_dir:
+            return self._offline_dir
         if not self._offline_mode:
             return None
-        return get_offline_dir(task_id=self.task_id)
+        self._offline_dir = get_offline_dir(task_id=self.task_id)
+        return self._offline_dir
 
     @classmethod
     def _clone_task(
@@ -2614,7 +2788,7 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         :param Session session: The session object used for sending requests to the API.
         :param logging.Logger log: The Log object.
         :param kwargs: Keyword args passed to the GetAllRequest
-            (see :class:`.backend_api.services.v2_5.tasks.GetAllRequest`)
+            (see :class:`.backend_api.service.v?.tasks.GetAllRequest` for details; the ? needs to be replaced by the appropriate version.)
 
             For example:
 
@@ -2632,19 +2806,28 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         return res
 
     @classmethod
-    def get_by_name(cls, task_name):
-        # type: (str) -> Task
+    def get_task_output_log_web_page(cls, task_id, project_id=None, app_server_host=None):
+        # type: (str, Optional[str], Optional[str]) -> str
         """
-        Returns the most recent task with the given name from anywhere in the system as a Task object.
+        Return the Task results & outputs web page address.
+        For example: https://demoapp.demo.clear.ml/projects/216431/experiments/60763e04/output/log
 
-        :param str task_name: The name of the task to search for.
-
-        :return: Task object of the most recent task with that name.
+        :param str task_id: Task ID.
+        :param str project_id: Project ID for this task.
+        :param str app_server_host: ClearML Application server host name.
+            If not provided, the current session will be used to resolve the host name.
+        :return: http/s URL link.
         """
-        res = cls._send(cls._get_default_session(), tasks.GetAllRequest(name=exact_match_regex(task_name)))
+        if not app_server_host:
+            if not hasattr(cls, "__cached_app_server_host"):
+                cls.__cached_app_server_host = Session.get_app_server_host()
+            app_server_host = cls.__cached_app_server_host
 
-        task = get_single_result(entity='task', query=task_name, results=res.response.tasks)
-        return cls(task_id=task.id)
+        return "{}/projects/{}/experiments/{}/output/log".format(
+            app_server_host.rstrip("/"),
+            project_id if project_id is not None else '*',
+            task_id,
+        )
 
     @classmethod
     def _get_project_name(cls, project_id):
@@ -2814,34 +2997,10 @@ class Task(IdObjectBase, AccessMixin, SetupUploadMixin):
         return is_subprocess
 
     @classmethod
-    def set_offline(cls, offline_mode=False):
-        # type: (bool) -> None
-        """
-        Set offline mode, where all data and logs are stored into local folder, for later transmission
-
-        :param offline_mode: If True, offline-mode is turned on, and no communication to the backend is enabled.
-        :return:
-        """
-        if not running_remotely():
-            ENV_OFFLINE_MODE.set(offline_mode)
-            InterfaceBase._offline_mode = bool(offline_mode)
-            Session._offline_mode = bool(offline_mode)
-
-    @classmethod
-    def is_offline(cls):
-        # type: () -> bool
-        """
-        Return offline-mode state, If in offline-mode, no communication to the backend is enabled.
-
-        :return: boolean offline-mode state
-        """
-        return cls._offline_mode
-
-    @classmethod
     def _get_task_status(cls, task_id):
         # type: (str) -> (Optional[str], Optional[str])
         if cls._offline_mode:
-            return tasks.TaskStatusEnum.created, 'offline'
+            return cls.TaskStatusEnum.created, 'offline'
 
         # noinspection PyBroadException
         try:
